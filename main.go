@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,7 +26,7 @@ import (
 	"google.golang.org/api/sheets/v4"
 )
 
-// ParsedData структура для хранения парсенных данных
+// Структура для хранения парсенных данных
 type ParsedData struct {
 	Address   string
 	Amount    string
@@ -37,146 +36,61 @@ type ParsedData struct {
 	DriveLink string
 }
 
-// Config структура для хранения конфигурации приложения
-type Config struct {
-	TelegramToken      string
-	SpreadsheetID      string
-	DriveFolderID      string
-	GoogleClientID     string
-	GoogleClientSecret string
-	ServerAddr         string
-	WebhookURL         string
-	Port               string
-	DeveloperChatID    int64  // Chat ID разработчика для уведомлений
-	GoogleOAuthToken   string // JSON-сериализованный OAuth2 токен
-}
-
-// fieldKeywords мапа ключевых слов и их синонимов для гибкого парсинга
+// Мапа ключевых слов и их синонимов для гибкого парсинга
 var fieldKeywords = map[string][]string{
 	"address": {"адрес", "объект", "квартира", "школа", "дом", "улица"},
 	"amount":  {"сумма", "стоимость", "оплата", "платёж"},
 	"comment": {"комментарий", "коммент", "прим", "примечание", "дополнение"},
 }
 
-// App основная структура приложения
-type App struct {
-	config        Config
-	bot           *tgbotapi.BotAPI
-	sheetsService *sheets.Service
-	driveService  *drive.Service
-	oauthConfig   *oauth2.Config
-	semaphore     chan struct{}
-	wg            sync.WaitGroup
-	oauthToken    *oauth2.Token
-}
+// OAuth2 конфигурация и каналы для обработки авторизации
+var (
+	oauthConfig *oauth2.Config
+	oauthState  = "state-token"
+	authCodeCh  = make(chan string)
+	wg          sync.WaitGroup
+)
 
-// NewApp инициализирует новое приложение
-func NewApp(cfg Config) (*App, error) {
-	app := &App{
-		config:    cfg,
-		semaphore: make(chan struct{}, 10), // maxGoroutines = 10
-	}
+// Настройка максимального количества горутин
+const maxGoroutines = 10
 
-	// Настройка OAuth2 конфигурации
-	app.oauthConfig = &oauth2.Config{
-		ClientID:     cfg.GoogleClientID,
-		ClientSecret: cfg.GoogleClientSecret,
-		RedirectURL:  "https://checkstosheets-production.up.railway.app/",
-		Scopes: []string{
-			"https://www.googleapis.com/auth/spreadsheets",
-			"https://www.googleapis.com/auth/drive.file",
-		},
-		Endpoint: google.Endpoint,
-	}
+// Семафор для ограничения числа горутин
+var semaphore = make(chan struct{}, maxGoroutines)
 
-	// Получение OAuth2 токена
-	var err error
-	app.oauthToken, err = app.getOAuthToken()
-	if err != nil {
-		app.notifyDeveloper(fmt.Sprintf("Не удалось получить OAuth2 токен: %v", err))
-		return nil, fmt.Errorf("не удалось получить OAuth2 токен: %w", err)
-	}
+// getClient получает OAuth2 клиента
+func getClient(config *oauth2.Config) (*http.Client, error) {
+	// Запуск HTTP-сервера для получения кода авторизации
+	serverErrCh := make(chan error, 1)
+	server := startOAuthServer(serverErrCh)
 
-	// Создание OAuth2 клиента
-	client := app.oauthConfig.Client(context.Background(), app.oauthToken)
-
-	// Создание Google Sheets сервиса
-	sheetsService, err := sheets.NewService(context.Background(), option.WithHTTPClient(client))
-	if err != nil {
-		app.notifyDeveloper(fmt.Sprintf("Не удалось создать Sheets сервис: %v", err))
-		return nil, fmt.Errorf("не удалось создать Sheets сервис: %w", err)
-	}
-	app.sheetsService = sheetsService
-
-	// Создание Google Drive сервиса
-	driveService, err := drive.NewService(context.Background(), option.WithHTTPClient(client))
-	if err != nil {
-		app.notifyDeveloper(fmt.Sprintf("Не удалось создать Drive сервис: %v", err))
-		return nil, fmt.Errorf("не удалось создать Drive сервис: %w", err)
-	}
-	app.driveService = driveService
-
-	// Создание Telegram бота
-	bot, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
-	if err != nil {
-		app.notifyDeveloper(fmt.Sprintf("Не удалось создать Telegram бота: %v", err))
-		return nil, fmt.Errorf("не удалось создать Telegram бота: %w", err)
-	}
-	bot.Debug = false // В продакшн режиме лучше отключить отладку
-	app.bot = bot
-
-	// Проверка необходимости обновления токена
-	if app.oauthToken.Valid() == false {
-		log.Println("Токен недействителен, требуется обновление.")
-		err := app.refreshOAuthToken()
-		if err != nil {
-			app.notifyDeveloper(fmt.Sprintf("Не удалось обновить OAuth2 токен: %v", err))
-			return nil, fmt.Errorf("не удалось обновить OAuth2 токен: %w", err)
-		}
-	}
-
-	return app, nil
-}
-
-// getOAuthToken получает OAuth2 токен из конфигурации или выполняет поток авторизации
-func (app *App) getOAuthToken() (*oauth2.Token, error) {
-	if app.config.GoogleOAuthToken != "" {
-		var token oauth2.Token
-		err := json.Unmarshal([]byte(app.config.GoogleOAuthToken), &token)
-		if err != nil {
-			return nil, fmt.Errorf("не удалось разобрать GoogleOAuthToken: %w", err)
-		}
-		return &token, nil
-	}
-
-	// Если токен не установлен, выполнить OAuth2 поток
-	token, err := app.performOAuthFlow()
-	if err != nil {
-		return nil, err
-	}
-
-	// Вывод токена для сохранения в Railway
-	tokenJSON, err := json.Marshal(token)
-	if err != nil {
-		return nil, fmt.Errorf("не удалось сериализовать токен: %w", err)
-	}
-	log.Printf("Ваш OAuth2 токен:\n%s\n\nСохраните его в переменной окружения GOOGLE_OAUTH_TOKEN", string(tokenJSON))
-
-	return token, nil
-}
-
-// performOAuthFlow выполняет OAuth2 поток для получения токена
-func (app *App) performOAuthFlow() (*oauth2.Token, error) {
-	authURL := app.oauthConfig.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
+	// Получение ссылки для авторизации
+	authURL := config.AuthCodeURL(oauthState, oauth2.AccessTypeOffline)
 	fmt.Printf("Перейдите по ссылке для авторизации:\n%v\n", authURL)
 
-	// Запуск временного HTTP-сервера для получения кода авторизации
-	codeCh := make(chan string)
-	serverErrCh := make(chan error, 1)
+	select {
+	case code := <-authCodeCh:
+		// Обмен кода на токены
+		tok, err := config.Exchange(context.Background(), code)
+		if err != nil {
+			return nil, fmt.Errorf("не удалось обменять код на токен: %v", err)
+		}
+		// Завершение работы сервера после получения кода
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Ошибка при завершении работы OAuth2 сервера: %v", err)
+		}
+		return config.Client(context.Background(), tok), nil
+	case err := <-serverErrCh:
+		return nil, fmt.Errorf("сервер OAuth2 завершился с ошибкой: %v", err)
+	}
+}
 
+// startOAuthServer запускает локальный HTTP-сервер для обработки редиректа OAuth2
+func startOAuthServer(errCh chan<- error) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("state") != "state-token" {
+		if r.URL.Query().Get("state") != oauthState {
 			http.Error(w, "Неверный state", http.StatusBadRequest)
 			return
 		}
@@ -186,182 +100,150 @@ func (app *App) performOAuthFlow() (*oauth2.Token, error) {
 			return
 		}
 		fmt.Fprintln(w, "Авторизация прошла успешно. Вы можете закрыть это окно.")
-		codeCh <- code
+		authCodeCh <- code
 	})
 
 	server := &http.Server{
-		Addr:    ":8081", // Используйте нестандартный порт, чтобы избежать конфликтов
+		Addr:    ":8080",
 		Handler: mux,
 	}
 
+	// Запуск сервера в отдельной горутине
 	go func() {
-		log.Println("Запуск временного OAuth2 сервера на :8081")
+		log.Println("Запуск OAuth2 сервера на https://railway.app/")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			serverErrCh <- err
+			errCh <- err
 		}
 	}()
 
-	// Ожидание кода авторизации или ошибки
-	select {
-	case code := <-codeCh:
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(ctx); err != nil {
-			log.Printf("Ошибка при завершении работы OAuth2 сервера: %v", err)
-		}
-		tok, err := app.oauthConfig.Exchange(context.Background(), code)
-		if err != nil {
-			return nil, fmt.Errorf("не удалось обменять код на токен: %w", err)
-		}
-		return tok, nil
-	case err := <-serverErrCh:
-		return nil, fmt.Errorf("сервер OAuth2 завершился с ошибкой: %w", err)
-	case <-time.After(120 * time.Second):
-		return nil, errors.New("таймаут ожидания OAuth2 кода")
-	}
-}
-
-// refreshOAuthToken обновляет OAuth2 токен, используя refresh токен
-func (app *App) refreshOAuthToken() error {
-	tokenSource := app.oauthConfig.TokenSource(context.Background(), app.oauthToken)
-	newToken, err := tokenSource.Token()
-	if err != nil {
-		return fmt.Errorf("не удалось обновить токен: %w", err)
-	}
-	app.oauthToken = newToken
-	return nil
+	return server
 }
 
 // getFullName возвращает полное имя пользователя из Telegram
 func getFullName(user *tgbotapi.User) string {
-	if user == nil {
-		return "Unknown"
-	}
+	// Проверяем, есть ли LastName
 	if user.LastName != "" {
 		return fmt.Sprintf("%s %s", user.FirstName, user.LastName)
 	}
 	return user.FirstName
 }
 
-// parseMessage извлекает Address, Amount и Comment из сообщения
-func parseMessage(message string) (address, amount, comment string, err error) {
-	if strings.TrimSpace(message) == "" {
+// parseMessage извлекает Адрес, Сумму и Комментарий из комментария с использованием мапы ключевых слов
+func parseMessage(message string) (address string, amount string, comment string, err error) {
+	if message == "" {
 		return "", "", "", errors.New("пустое сообщение")
 	}
 
+	// Разбиваем сообщение на строки
 	lines := strings.Split(message, "\n")
-	fieldsFound := map[string]string{}
+	var addr, amt, comm string
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
+		// Используем регулярные выражения для более гибкого поиска
 		for field, keywords := range fieldKeywords {
 			for _, keyword := range keywords {
+				// Регулярное выражение для поиска "ключ: значение" с учётом синонимов и регистронезависимости
 				pattern := fmt.Sprintf(`(?i)^%s:\s*(.+)`, regexp.QuoteMeta(keyword))
 				re := regexp.MustCompile(pattern)
 				matches := re.FindStringSubmatch(line)
 				if len(matches) == 2 {
-					// Если поле уже найдено, пропускаем
-					if _, exists := fieldsFound[field]; exists {
-						continue
+					switch field {
+					case "address":
+						addr = matches[1]
+					case "amount":
+						amt = matches[1]
+					case "comment":
+						comm = matches[1]
 					}
-					fieldsFound[field] = strings.TrimSpace(matches[1])
-					break
+					break // Если найдено соответствие, не ищем дальше
 				}
 			}
 		}
 	}
 
 	// Проверка обязательных полей
-	addr, addrOk := fieldsFound["address"]
-	amt, amtOk := fieldsFound["amount"]
-	comm, commOk := fieldsFound["comment"]
-
-	if !addrOk || !amtOk {
+	if addr == "" || amt == "" {
 		return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
 	}
 
-	if commOk {
-		return addr, amt, comm, nil
-	}
-
-	return addr, amt, "", nil
+	// Комментарий может быть пустым
+	return addr, amt, comm, nil
 }
 
 // sanitizeFileName удаляет или заменяет запрещенные символы из имени файла
 func sanitizeFileName(name string) string {
+	// Заменяем все символы, кроме букв, цифр и некоторых специальных символов, на подчёркивания
 	re := regexp.MustCompile(`[<>:"/\\|?*]+`)
 	return re.ReplaceAllString(name, "_")
 }
 
 // handlePhotoMessage обрабатывает сообщение с фотографией
-func (app *App) handlePhotoMessage(ctx context.Context, message *tgbotapi.Message) {
-	defer app.wg.Done()
-	defer func() { <-app.semaphore }()
-
+func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, driveFolderId string) {
+	// Получение комментария из сообщения
 	comment := message.Caption
 
-	address, amount, commentText, err := parseMessage(comment)
-	if err != nil {
-		log.Printf("Ошибка при парсинге сообщения: %v", err)
-		app.notifyDeveloper(fmt.Sprintf("Ошибка при парсинге сообщения от пользователя %s: %v", getFullName(message.From), err))
+	// Парсинг комментария
+	address, amount, commentText, parseErr := parseMessage(comment)
+	if parseErr != nil {
+		log.Printf("Ошибка при парсинге сообщения: %v", parseErr)
 		return
 	}
 
+	// Извлечение дополнительных данных
 	username := getFullName(message.From)
 	dateFormatted := time.Unix(int64(message.Date), 0).Format("02012006_150405")
 
+	// Получение файла из Telegram
 	if len(message.Photo) == 0 {
 		log.Println("Сообщение не содержит фотографий")
-		app.notifyDeveloper(fmt.Sprintf("Сообщение от пользователя %s не содержит фотографий", username))
 		return
 	}
 
+	// Выбираем фото с наибольшим разрешением (последнее в срезе)
 	photo := message.Photo[len(message.Photo)-1]
 	fileID := photo.FileID
-	fileConfig := tgbotapi.FileConfig{FileID: fileID}
-	file, err := app.bot.GetFile(fileConfig)
+	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
 		log.Printf("Ошибка при получении файла: %v", err)
-		app.notifyDeveloper(fmt.Sprintf("Ошибка при получении файла от пользователя %s: %v", username, err))
 		return
 	}
 
-	fileURL := file.Link(app.bot.Token)
+	// Скачивание файла
+	fileURL := file.Link(bot.Token)
 	resp, err := http.Get(fileURL)
 	if err != nil {
 		log.Printf("Ошибка при скачивании файла: %v", err)
-		app.notifyDeveloper(fmt.Sprintf("Ошибка при скачивании файла от пользователя %s: %v", username, err))
 		return
 	}
 	defer resp.Body.Close()
 
+	// Создание имени файла: "address_date.jpg"
 	sanitizedAddress := sanitizeFileName(address)
 	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, dateFormatted)
 
+	// Сохранение файла во временную директорию
 	tmpFile, err := ioutil.TempFile("", fileName)
 	if err != nil {
 		log.Printf("Не удалось создать временный файл: %v", err)
-		app.notifyDeveloper(fmt.Sprintf("Не удалось создать временный файл для пользователя %s: %v", username, err))
 		return
 	}
-	defer func() {
-		tmpFile.Close()
-		os.Remove(tmpFile.Name())
-	}()
+	defer os.Remove(tmpFile.Name())
 
-	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+	_, err = io.Copy(tmpFile, resp.Body)
+	if err != nil {
 		log.Printf("Ошибка при сохранении файла: %v", err)
-		app.notifyDeveloper(fmt.Sprintf("Ошибка при сохранении файла для пользователя %s: %v", username, err))
 		return
 	}
 
-	driveLink, err := app.uploadFileToDrive(tmpFile.Name(), fileName)
+	// Загрузка файла на Google Drive
+	driveLink, err := uploadFileToDrive(driveService, tmpFile.Name(), fileName, driveFolderId)
 	if err != nil {
 		log.Printf("Ошибка при загрузке файла на Drive: %v", err)
-		app.notifyDeveloper(fmt.Sprintf("Ошибка при загрузке файла на Drive для пользователя %s: %v", username, err))
 		return
 	}
 
+	// Добавление данных в Google Sheets
 	parsedData := ParsedData{
 		Address:   address,
 		Amount:    amount,
@@ -371,9 +253,9 @@ func (app *App) handlePhotoMessage(ctx context.Context, message *tgbotapi.Messag
 		DriveLink: driveLink,
 	}
 
-	if err := app.appendToSheet(parsedData); err != nil {
+	err = appendToSheet(sheetsService, spreadsheetId, parsedData)
+	if err != nil {
 		log.Printf("Ошибка при записи в Google Sheets: %v", err)
-		app.notifyDeveloper(fmt.Sprintf("Ошибка при записи в Google Sheets для пользователя %s: %v", username, err))
 		return
 	}
 
@@ -381,34 +263,35 @@ func (app *App) handlePhotoMessage(ctx context.Context, message *tgbotapi.Messag
 }
 
 // uploadFileToDrive загружает файл на Google Drive и возвращает ссылку
-func (app *App) uploadFileToDrive(filePath, fileName string) (string, error) {
+func uploadFileToDrive(service *drive.Service, filePath, fileName, folderId string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		return "", fmt.Errorf("не удалось открыть файл для загрузки: %w", err)
+		return "", fmt.Errorf("не удалось открыть файл для загрузки: %v", err)
 	}
 	defer f.Close()
 
 	file := &drive.File{
 		Name:    fileName,
-		Parents: []string{app.config.DriveFolderID},
+		Parents: []string{folderId},
 	}
 
-	res, err := app.driveService.Files.Create(file).Media(f).Fields("webViewLink").Do()
+	res, err := service.Files.Create(file).Media(f).Fields("webViewLink").Do()
 	if err != nil {
-		return "", fmt.Errorf("не удалось загрузить файл на Google Drive: %w", err)
+		return "", fmt.Errorf("не удалось загрузить файл на Google Drive: %v", err)
 	}
 
 	return res.WebViewLink, nil
 }
 
 // appendToSheet добавляет строку данных в Google Sheets в столбцы B-G
-func (app *App) appendToSheet(data ParsedData) error {
+func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedData) error {
+	// Формирование значений для вставки
 	values := []interface{}{
 		data.Date,      // Столбец B
 		data.Username,  // Столбец C
 		data.Address,   // Столбец D
 		data.Amount,    // Столбец E
-		data.Comment,   // Столбец F
+		data.Comment,   // Столбец F (может быть пустым)
 		data.DriveLink, // Столбец G
 	}
 
@@ -416,10 +299,9 @@ func (app *App) appendToSheet(data ParsedData) error {
 		Values: [][]interface{}{values},
 	}
 
-	// Получение текущего количества строк
-	resp, err := app.sheetsService.Spreadsheets.Values.Get(app.config.SpreadsheetID, "'Чеки'!B:B").Do()
+	resp, err := service.Spreadsheets.Values.Get(spreadsheetId, "'Чеки'!B:B").Do()
 	if err != nil {
-		return fmt.Errorf("не удалось получить данные из Google Sheets: %w", err)
+		return fmt.Errorf("не удалось получить данные из Google Sheets: %v", err)
 	}
 
 	lastRow := 1
@@ -429,216 +311,161 @@ func (app *App) appendToSheet(data ParsedData) error {
 
 	rangeStr := fmt.Sprintf("'Чеки'!B%d:G%d", lastRow, lastRow)
 
-	_, err = app.sheetsService.Spreadsheets.Values.Update(app.config.SpreadsheetID, rangeStr, vr).
+	_, err = service.Spreadsheets.Values.Update(spreadsheetId, rangeStr, vr).
 		ValueInputOption("RAW").
 		Do()
 	if err != nil {
-		return fmt.Errorf("не удалось обновить Google Sheets: %w", err)
+		return fmt.Errorf("не удалось обновить Google Sheets: %v", err)
 	}
 
 	return nil
 }
 
-// handleUpdate обрабатывает входящие обновления от Telegram
-func (app *App) handleUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Unsupported method", http.StatusMethodNotAllowed)
-		return
+func main() {
+	// Чтение переменных окружения
+	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	if telegramToken == "" {
+		log.Fatal("TELEGRAM_BOT_TOKEN не установлен в переменных окружения")
 	}
 
-	var update tgbotapi.Update
-	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-		log.Printf("Ошибка декодирования обновления: %v", err)
-		app.notifyDeveloper(fmt.Sprintf("Ошибка декодирования обновления: %v", err))
-		http.Error(w, "Bad Request", http.StatusBadRequest)
-		return
+	spreadsheetId := os.Getenv("GOOGLE_SHEET_ID")
+	if spreadsheetId == "" {
+		log.Fatal("GOOGLE_SHEET_ID не установлен в переменных окружения")
 	}
 
-	if update.Message != nil && len(update.Message.Photo) > 0 {
-		app.semaphore <- struct{}{}
-		app.wg.Add(1)
-		go app.handlePhotoMessage(r.Context(), update.Message)
+	driveFolderId := os.Getenv("GOOGLE_DRIVE_FOLDER_ID")
+	if driveFolderId == "" {
+		log.Fatal("GOOGLE_DRIVE_FOLDER_ID не установлен в переменных окружения")
 	}
 
-	w.WriteHeader(http.StatusOK)
-}
-
-// Run запускает HTTP сервер и обрабатывает сигналы завершения
-func (app *App) Run() error {
-	http.HandleFunc("/", app.handleUpdate)
-
-	server := &http.Server{
-		Addr:    app.config.ServerAddr,
-		Handler: nil,
+	googleClientID := os.Getenv("GOOGLE_OAUTH_CLIENT_ID")
+	googleClientSecret := os.Getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+	if googleClientID == "" || googleClientSecret == "" {
+		log.Fatal("GOOGLE_OAUTH_CLIENT_ID и GOOGLE_OAUTH_CLIENT_SECRET должны быть установлены в переменных окружения")
 	}
 
-	// Канал для получения сигналов ОС
+	serverAddr := os.Getenv("SERVER_ADDR")
+	if serverAddr == "" {
+		serverAddr = ":8080"
+	}
+
+	// Настройка OAuth2 конфигурации
+	oauthConfig = &oauth2.Config{
+		ClientID:     googleClientID,
+		ClientSecret: googleClientSecret,
+		RedirectURL:  "https://checkstosheets-production.up.railway.app/",
+		Scopes: []string{
+			"https://www.googleapis.com/auth/spreadsheets",
+			"https://www.googleapis.com/auth/drive.file",
+		},
+		Endpoint: google.Endpoint,
+	}
+
+	client, err := getClient(oauthConfig)
+	if err != nil {
+		log.Fatalf("Не удалось получить OAuth2 клиента: %v", err)
+	}
+
+	// Создание Google Sheets сервиса
+	sheetsService, err := sheets.NewService(context.Background(), option.WithHTTPClient(client))
+	if err != nil {
+		log.Fatalf("Не удалось создать Sheets сервис: %v", err)
+	}
+
+	// Создание Google Drive сервиса
+	driveService, err := drive.NewService(context.Background(), option.WithHTTPClient(client))
+	if err != nil {
+		log.Fatalf("Не удалось создать Drive сервис: %v", err)
+	}
+
+	// Создание Telegram бота
+	bot, err := tgbotapi.NewBotAPI(telegramToken)
+	if err != nil {
+		log.Panic(err)
+	}
+	bot.Debug = true
+	log.Printf("Авторизовался как %s", bot.Self.UserName)
+
+	// Настройка Webhook
+	webhookURL := os.Getenv("WEBHOOK_URL")
+	if webhookURL == "" {
+		log.Fatal("WEBHOOK_URL не установлен в переменных окружения")
+	}
+
+	url, err := url.Parse(webhookURL)
+	if err != nil {
+		log.Fatalf("Неверный формат WEBHOOK_URL: %v", err)
+	}
+
+	_, err = bot.Request(tgbotapi.WebhookConfig{
+		URL: url,
+	})
+	if err != nil {
+		log.Fatalf("Не удалось установить Webhook: %v", err)
+	}
+	log.Printf("Webhook установлен на %s", webhookURL)
+
+	// Обработчик для входящих обновлений
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			bytes, _ := ioutil.ReadAll(r.Body)
+			var update tgbotapi.Update
+			err := json.Unmarshal(bytes, &update)
+			if err != nil {
+				log.Printf("Ошибка декодирования обновления: %v", err)
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
+			}
+
+			if update.Message != nil && update.Message.Photo != nil {
+				// Ограничение количества горутин с использованием семафора
+				semaphore <- struct{}{} // Блокируем, если достигнуто максимальное количество горутин
+				wg.Add(1)
+				go func(message *tgbotapi.Message) {
+					defer wg.Done()
+					handlePhotoMessage(bot, message, sheetsService, spreadsheetId, driveService, driveFolderId)
+					<-semaphore // Освобождаем место в канале
+				}(update.Message)
+			}
+
+			w.WriteHeader(http.StatusOK)
+		} else {
+			http.Error(w, "Unsupported method", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// Получение порта из переменных окружения Railway
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Порт по умолчанию, если не задан в переменных окружения
+	}
+
+	// Запуск HTTP-сервера
+	log.Printf("Запуск HTTP сервера на порту %s", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Ошибка запуска HTTP сервера: %v", err)
+	}
+
+	// Создание канала для получения сигналов ОС
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
-	// Горутина для запуска сервера
-	go func() {
-		log.Printf("Запуск HTTP сервера на %s", app.config.ServerAddr)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Ошибка запуска HTTP сервера: %v", err)
-		}
-	}()
-
-	// Блокировка до получения сигнала
+	// Ожидание сигнала завершения (например, Ctrl+C)
 	<-quit
 	log.Println("Получен сигнал завершения, останавливаем бота...")
 
-	// Контекст для завершения сервера
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Завершение работы сервера
-	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Ошибка при завершении HTTP сервера: %v", err)
-	}
-
 	// Удаление Webhook
-	if _, err := app.bot.Request(tgbotapi.DeleteWebhookConfig{DropPendingUpdates: true}); err != nil {
+	_, err = bot.Request(tgbotapi.DeleteWebhookConfig{
+		DropPendingUpdates: true,
+	})
+	if err != nil {
 		log.Printf("Не удалось удалить Webhook: %v", err)
 	} else {
 		log.Println("Webhook удален")
 	}
 
-	// Ожидание завершения горутин
-	app.wg.Wait()
+	// Ожидание завершения всех горутин обработки сообщений
+	wg.Wait()
 
 	log.Println("Бот успешно остановлен.")
-	return nil
-}
-
-// loadConfig загружает конфигурацию из переменных окружения
-func loadConfig() (Config, error) {
-	cfg := Config{
-		TelegramToken:      os.Getenv("TELEGRAM_BOT_TOKEN"),
-		SpreadsheetID:      os.Getenv("GOOGLE_SHEET_ID"),
-		DriveFolderID:      os.Getenv("GOOGLE_DRIVE_FOLDER_ID"),
-		GoogleClientID:     os.Getenv("GOOGLE_OAUTH_CLIENT_ID"),
-		GoogleClientSecret: os.Getenv("GOOGLE_OAUTH_CLIENT_SECRET"),
-		ServerAddr:         os.Getenv("SERVER_ADDR"),
-		WebhookURL:         os.Getenv("WEBHOOK_URL"),
-		Port:               os.Getenv("PORT"),
-		GoogleOAuthToken:   os.Getenv("GOOGLE_OAUTH_TOKEN"),
-	}
-
-	// Конвертация DeveloperChatID из строки в int64
-	developerChatIDStr := os.Getenv("DEVELOPER_CHAT_ID")
-	if developerChatIDStr != "" {
-		var err error
-		_, err = fmt.Sscan(developerChatIDStr, &cfg.DeveloperChatID)
-		if err != nil {
-			return cfg, fmt.Errorf("некорректный формат DEVELOPER_CHAT_ID: %v", err)
-		}
-	}
-
-	// Установка значений по умолчанию
-	if cfg.ServerAddr == "" {
-		cfg.ServerAddr = ":8080"
-	}
-	if cfg.Port == "" {
-		cfg.Port = "8080"
-	}
-
-	// Проверка обязательных полей
-	missing := []string{}
-	if cfg.TelegramToken == "" {
-		missing = append(missing, "TELEGRAM_BOT_TOKEN")
-	}
-	if cfg.SpreadsheetID == "" {
-		missing = append(missing, "GOOGLE_SHEET_ID")
-	}
-	if cfg.DriveFolderID == "" {
-		missing = append(missing, "GOOGLE_DRIVE_FOLDER_ID")
-	}
-	if cfg.GoogleClientID == "" || cfg.GoogleClientSecret == "" {
-		missing = append(missing, "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")
-	}
-	if cfg.WebhookURL == "" {
-		missing = append(missing, "WEBHOOK_URL")
-	}
-	if cfg.DeveloperChatID == 0 {
-		missing = append(missing, "DEVELOPER_CHAT_ID")
-	}
-
-	if len(missing) > 0 {
-		return cfg, fmt.Errorf("отсутствуют обязательные переменные окружения: %s", strings.Join(missing, ", "))
-	}
-
-	return cfg, nil
-}
-
-// notifyDeveloper отправляет сообщение разработчику через Telegram
-func (app *App) notifyDeveloper(message string) {
-	if app.config.DeveloperChatID == 0 {
-		log.Println("DEVELOPER_CHAT_ID не задан, уведомление не отправлено")
-		return
-	}
-
-	msg := tgbotapi.NewMessage(app.config.DeveloperChatID, fmt.Sprintf("⚠️ *Ошибка в боте*\n\n%s", message))
-	msg.ParseMode = "Markdown"
-
-	_, err := app.bot.Send(msg)
-	if err != nil {
-		log.Printf("Не удалось отправить уведомление разработчику: %v", err)
-	}
-}
-
-// getStackTrace возвращает стек вызовов в строковом виде
-func getStackTrace() string {
-	buf := make([]byte, 1<<16)
-	n := runtime.Stack(buf, false)
-	return string(buf[:n])
-}
-
-func main() {
-	// Настройка логирования
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-
-	// Загрузка конфигурации
-	cfg, err := loadConfig()
-	if err != nil {
-		log.Fatalf("Ошибка загрузки конфигурации: %v", err)
-	}
-
-	// Инициализация приложения
-	app, err := NewApp(cfg)
-	if err != nil {
-		log.Fatalf("Ошибка инициализации приложения: %v", err)
-	}
-
-	// Обработка паник и отправка уведомлений
-	defer func() {
-		if r := recover(); r != nil {
-			errMsg := fmt.Sprintf("Паника: %v\nStack Trace:\n%s", r, getStackTrace())
-			log.Println(errMsg)
-			app.notifyDeveloper(errMsg)
-		}
-	}()
-
-	// Настройка Webhook
-	webhookURL := cfg.WebhookURL
-	urlParsed, err := url.Parse(webhookURL)
-	if err != nil {
-		app.notifyDeveloper(fmt.Sprintf("Неверный формат WEBHOOK_URL: %v", err))
-		log.Fatalf("Неверный формат WEBHOOK_URL: %v", err)
-	}
-
-	_, err = app.bot.Request(tgbotapi.WebhookConfig{
-		URL: urlParsed,
-	})
-	if err != nil {
-		app.notifyDeveloper(fmt.Sprintf("Не удалось установить Webhook: %v", err))
-		log.Fatalf("Не удалось установить Webhook: %v", err)
-	}
-	log.Printf("Webhook установлен на %s", webhookURL)
-
-	// Запуск приложения
-	if err := app.Run(); err != nil {
-		app.notifyDeveloper(fmt.Sprintf("Ошибка выполнения приложения: %v", err))
-		log.Fatalf("Ошибка выполнения приложения: %v", err)
-	}
 }
