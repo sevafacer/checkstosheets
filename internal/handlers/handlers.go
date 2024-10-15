@@ -168,6 +168,7 @@ func (h *Handler) handlePhotoMessage(ctx context.Context, message *tgbotapi.Mess
 	sanitizedAddress := utils.SanitizeFileName(address)
 	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, dateFormatted)
 
+	// Создание временного файла
 	tmpFile, err := os.CreateTemp("", fileName)
 	if err != nil {
 		h.Log.Printf("Не удалось создать временный файл: %v", err)
@@ -179,12 +180,14 @@ func (h *Handler) handlePhotoMessage(ctx context.Context, message *tgbotapi.Mess
 		os.Remove(tmpFile.Name())
 	}()
 
+	// Копирование данных из ответа в файл
 	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
 		h.Log.Printf("Ошибка при сохранении файла: %v", err)
 		h.TelegramService.SendMessage(h.Config.DeveloperChatID, fmt.Sprintf("⚠️ *Ошибка при сохранении файла для пользователя %s:* %v", username, err))
 		return
 	}
 
+	// Загрузка файла на Google Drive
 	driveLink, err := h.GoogleService.UploadFile(tmpFile.Name(), fileName, h.Config.DriveFolderID)
 	if err != nil {
 		h.Log.Printf("Ошибка при загрузке файла на Drive: %v", err)
@@ -192,6 +195,7 @@ func (h *Handler) handlePhotoMessage(ctx context.Context, message *tgbotapi.Mess
 		return
 	}
 
+	// Создание структуры ParsedData
 	parsedData := utils.ParsedData{
 		Address:   address,
 		Amount:    amount,
@@ -201,6 +205,7 @@ func (h *Handler) handlePhotoMessage(ctx context.Context, message *tgbotapi.Mess
 		DriveLink: driveLink,
 	}
 
+	// Добавление данных в Google Sheets
 	if err := h.GoogleService.AppendToSheet(h.Config.SpreadsheetID, parsedData); err != nil {
 		h.Log.Printf("Ошибка при записи в Google Sheets: %v", err)
 		h.TelegramService.SendMessage(h.Config.DeveloperChatID, fmt.Sprintf("⚠️ *Ошибка при записи в Google Sheets для пользователя %s:* %v", username, err))
