@@ -228,7 +228,7 @@ func startOAuthServer(errCh chan<- error) *http.Server {
 
 	// Запуск сервера в отдельной горутине
 	go func() {
-		log.Println("Запуск OAuth2 сервера на http://localhost:8080/")
+		log.Println("Запуск OAuth2 сервера на https://railway.app/")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
