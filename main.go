@@ -86,7 +86,7 @@ func main() {
 	oauthConfig = &oauth2.Config{
 		ClientID:     googleClientID,
 		ClientSecret: googleClientSecret,
-		RedirectURL:  "http://localhost:8080/",
+		RedirectURL:  "https://resilient-prosperity.up.railway.app/oauth/callback",
 		Scopes: []string{
 			"https://www.googleapis.com/auth/spreadsheets",
 			"https://www.googleapis.com/auth/drive.file",
