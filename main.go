@@ -81,7 +81,7 @@ func NewApp(cfg Config) (*App, error) {
 	app.oauthConfig = &oauth2.Config{
 		ClientID:     cfg.GoogleClientID,
 		ClientSecret: cfg.GoogleClientSecret,
-		RedirectURL:  cfg.WebhookURL, // Убедитесь, что RedirectURL совпадает с настройками в Google API Console
+		RedirectURL:  "https://checkstosheets-production.up.railway.app/",
 		Scopes: []string{
 			"https://www.googleapis.com/auth/spreadsheets",
 			"https://www.googleapis.com/auth/drive.file",
