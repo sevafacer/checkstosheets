@@ -17,7 +17,6 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
-	"github.com/joho/godotenv"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
@@ -57,9 +56,6 @@ const maxGoroutines = 10
 var semaphore = make(chan struct{}, maxGoroutines)
 
 func main() {
-	// Загрузка переменных окружения
-	loadEnv()
-
 	// Чтение переменных окружения
 	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if telegramToken == "" {
@@ -86,7 +82,7 @@ func main() {
 	oauthConfig = &oauth2.Config{
 		ClientID:     googleClientID,
 		ClientSecret: googleClientSecret,
-		RedirectURL:  "https://checkstosheets-production.up.railway.app",
+		RedirectURL:  "https://checkstosheets-production.up.railway.app/oauth2/callback",
 		Scopes: []string{
 			"https://www.googleapis.com/auth/spreadsheets",
 			"https://www.googleapis.com/auth/drive.file",
@@ -166,14 +162,6 @@ func main() {
 	log.Println("Бот успешно остановлен.")
 }
 
-// loadEnv загружает переменные окружения из .env файла
-func loadEnv() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("Файл .env не найден, продолжаем...")
-	}
-}
-
 // getClient получает OAuth2 клиента
 func getClient(config *oauth2.Config) (*http.Client, error) {
 	// Запуск HTTP-сервера для получения кода авторизации
@@ -184,7 +172,6 @@ func getClient(config *oauth2.Config) (*http.Client, error) {
 	authURL := config.AuthCodeURL(oauthState, oauth2.AccessTypeOffline)
 	fmt.Printf("Перейдите по ссылке для авторизации:\n%v\n", authURL)
 
-	// Ожидание получения кода авторизации или ошибки сервера
 	select {
 	case code := <-authCodeCh:
 		// Обмен кода на токены
