@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -180,7 +179,7 @@ func sanitizeFileName(name string) string {
 }
 
 // handlePhotoMessage обрабатывает сообщение с фотографией
-func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, driveFolderId string, adminChatID int64) {
+func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, driveFolderId string) {
 	// Получение комментария из сообщения
 	comment := message.Caption
 
@@ -322,18 +321,6 @@ func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedDat
 	return nil
 }
 
-// notifyAdmin отправляет уведомление администратору бота в Telegram
-func notifyAdmin(bot *tgbotapi.BotAPI, adminChatID int64, message string) {
-	if adminChatID == 0 {
-		return
-	}
-	msg := tgbotapi.NewMessage(adminChatID, message)
-	_, err := bot.Send(msg)
-	if err != nil {
-		log.Printf("Не удалось отправить уведомление администратору: %v", err)
-	}
-}
-
 func main() {
 	// Чтение переменных окружения
 	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
@@ -360,16 +347,6 @@ func main() {
 	serverAddr := os.Getenv("SERVER_ADDR")
 	if serverAddr == "" {
 		serverAddr = ":8080"
-	}
-
-	adminChatIDStr := os.Getenv("ADMIN_CHAT_ID")
-	var adminChatID int64
-	if adminChatIDStr != "" {
-		var err error
-		adminChatID, err = strconv.ParseInt(adminChatIDStr, 10, 64)
-		if err != nil {
-			log.Fatalf("Не удалось конвертировать ADMIN_CHAT_ID: %v", err)
-		}
 	}
 
 	// Настройка OAuth2 конфигурации
@@ -446,7 +423,7 @@ func main() {
 				wg.Add(1)
 				go func(message *tgbotapi.Message) {
 					defer wg.Done()
-					handlePhotoMessage(bot, message, sheetsService, spreadsheetId, driveService, driveFolderId, adminChatID)
+					handlePhotoMessage(bot, message, sheetsService, spreadsheetId, driveService, driveFolderId)
 					<-semaphore // Освобождаем место в канале
 				}(update.Message)
 			}
