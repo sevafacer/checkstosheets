@@ -26,7 +26,6 @@ import (
 	"google.golang.org/api/sheets/v4"
 )
 
-// Структура для хранения парсенных данных
 type ParsedData struct {
 	Address   string
 	Amount    string
@@ -36,14 +35,12 @@ type ParsedData struct {
 	DriveLink string
 }
 
-// Мапа ключевых слов и их синонимов для гибкого парсинга
 var fieldKeywords = map[string][]string{
 	"address": {"адрес", "объект", "квартира", "школа", "дом", "улица"},
 	"amount":  {"сумма", "стоимость", "оплата", "платёж"},
 	"comment": {"комментарий", "коммент", "прим", "примечание", "дополнение"},
 }
 
-// OAuth2 конфигурация и каналы для обработки авторизации
 var (
 	oauthConfig *oauth2.Config
 	oauthState  = "state-token"
@@ -57,9 +54,49 @@ const maxGoroutines = 10
 // Семафор для ограничения числа горутин
 var semaphore = make(chan struct{}, maxGoroutines)
 
+// saveTokenToSecrets сохраняет токен в секретах Railway
+func saveTokenToSecrets(token *oauth2.Token) error {
+	tokenJSON, err := json.Marshal(token)
+	if err != nil {
+		return fmt.Errorf("не удалось сериализовать токен: %v", err)
+	}
+
+	// Сохраняем токен в секретах Railway как переменную среды
+	// В Railway переменные среды управляются через систему секретов
+	err = os.Setenv("GOOGLE_OAUTH_TOKEN", string(tokenJSON))
+	if err != nil {
+		return fmt.Errorf("не удалось сохранить токен в переменных среды: %v", err)
+	}
+
+	return nil
+}
+
+// loadTokenFromSecrets загружает токен из секретов Railway
+func loadTokenFromSecrets() (*oauth2.Token, error) {
+	tokenJSON := os.Getenv("GOOGLE_OAUTH_TOKEN")
+	if tokenJSON == "" {
+		return nil, errors.New("токен не найден в переменных среды")
+	}
+
+	var token oauth2.Token
+	err := json.Unmarshal([]byte(tokenJSON), &token)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось десериализовать токен: %v", err)
+	}
+
+	return &token, nil
+}
+
 // getClient получает OAuth2 клиента
 func getClient(config *oauth2.Config) (*http.Client, error) {
-	// Запуск HTTP-сервера для получения кода авторизации
+	// Сначала пытаемся загрузить сохранённый токен из секретов Railway
+	token, err := loadTokenFromSecrets()
+	if err == nil {
+		// Если токен найден, возвращаем клиента с этим токеном
+		return config.Client(context.Background(), token), nil
+	}
+
+	// Запуск HTTP-сервера для получения кода авторизации, если токена нет
 	serverErrCh := make(chan error, 1)
 	server := startOAuthServer(serverErrCh)
 
@@ -74,13 +111,21 @@ func getClient(config *oauth2.Config) (*http.Client, error) {
 		if err != nil {
 			return nil, fmt.Errorf("не удалось обменять код на токен: %v", err)
 		}
-		// Завершение работы сервера после получения кода
+
+		// Сохраняем токен в секретах Railway
+		err = saveTokenToSecrets(tok)
+		if err != nil {
+			return nil, fmt.Errorf("не удалось сохранить токен в секретах: %v", err)
+		}
+
+		// Завершение работы сервера
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
 			log.Printf("Ошибка при завершении работы OAuth2 сервера: %v", err)
 		}
 		return config.Client(context.Background(), tok), nil
+
 	case err := <-serverErrCh:
 		return nil, fmt.Errorf("сервер OAuth2 завершился с ошибкой: %v", err)
 	}
