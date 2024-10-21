@@ -388,7 +388,7 @@ func main() {
 		log.Fatal("GOOGLE_DRIVE_FOLDER_ID не установлен в переменных окружения")
 	}
 
-	adminIDStr := os.Getenv("ADMIN_CHAT_ID")
+	adminIDStr := strings.TrimSpace(os.Getenv("ADMIN_CHAT_ID"))
 	if adminIDStr == "" {
 		log.Fatal("ADMIN_CHAT_ID не установлен в переменных окружения")
 	}
