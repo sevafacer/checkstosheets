@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -48,21 +49,16 @@ var (
 	wg          sync.WaitGroup
 )
 
-// Настройка максимального количества горутин
 const maxGoroutines = 10
 
-// Семафор для ограничения числа горутин
 var semaphore = make(chan struct{}, maxGoroutines)
 
-// saveTokenToSecrets сохраняет токен в секретах Railway
 func saveTokenToSecrets(token *oauth2.Token) error {
 	tokenJSON, err := json.Marshal(token)
 	if err != nil {
 		return fmt.Errorf("не удалось сериализовать токен: %v", err)
 	}
 
-	// Сохраняем токен в секретах Railway как переменную среды
-	// В Railway переменные среды управляются через систему секретов
 	err = os.Setenv("GOOGLE_OAUTH_TOKEN", string(tokenJSON))
 	if err != nil {
 		return fmt.Errorf("не удалось сохранить токен в переменных среды: %v", err)
@@ -71,7 +67,6 @@ func saveTokenToSecrets(token *oauth2.Token) error {
 	return nil
 }
 
-// loadTokenFromSecrets загружает токен из секретов Railway
 func loadTokenFromSecrets() (*oauth2.Token, error) {
 	tokenJSON := os.Getenv("GOOGLE_OAUTH_TOKEN")
 	if tokenJSON == "" {
@@ -87,38 +82,30 @@ func loadTokenFromSecrets() (*oauth2.Token, error) {
 	return &token, nil
 }
 
-// getClient получает OAuth2 клиента
 func getClient(config *oauth2.Config) (*http.Client, error) {
-	// Сначала пытаемся загрузить сохранённый токен из секретов Railway
 	token, err := loadTokenFromSecrets()
 	if err == nil {
-		// Если токен найден, возвращаем клиента с этим токеном
 		return config.Client(context.Background(), token), nil
 	}
 
-	// Запуск HTTP-сервера для получения кода авторизации, если токена нет
 	serverErrCh := make(chan error, 1)
 	server := startOAuthServer(serverErrCh)
 
-	// Получение ссылки для авторизации
 	authURL := config.AuthCodeURL(oauthState, oauth2.AccessTypeOffline)
 	fmt.Printf("Перейдите по ссылке для авторизации:\n%v\n", authURL)
 
 	select {
 	case code := <-authCodeCh:
-		// Обмен кода на токены
 		tok, err := config.Exchange(context.Background(), code)
 		if err != nil {
 			return nil, fmt.Errorf("не удалось обменять код на токен: %v", err)
 		}
 
-		// Сохраняем токен в секретах Railway
 		err = saveTokenToSecrets(tok)
 		if err != nil {
 			return nil, fmt.Errorf("не удалось сохранить токен в секретах: %v", err)
 		}
 
-		// Завершение работы сервера
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
@@ -131,7 +118,6 @@ func getClient(config *oauth2.Config) (*http.Client, error) {
 	}
 }
 
-// startOAuthServer запускает локальный HTTP-сервер для обработки редиректа OAuth2
 func startOAuthServer(errCh chan<- error) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +139,6 @@ func startOAuthServer(errCh chan<- error) *http.Server {
 		Handler: mux,
 	}
 
-	// Запуск сервера в отдельной горутине
 	go func() {
 		log.Println("Запуск OAuth2 сервера на https://railway.app/")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -164,113 +149,128 @@ func startOAuthServer(errCh chan<- error) *http.Server {
 	return server
 }
 
-// getFullName возвращает полное имя пользователя из Telegram
 func getFullName(user *tgbotapi.User) string {
-	// Проверяем, есть ли LastName
 	if user.LastName != "" {
 		return fmt.Sprintf("%s %s", user.FirstName, user.LastName)
 	}
 	return user.FirstName
 }
 
-// parseMessage извлекает Адрес, Сумму и Комментарий из комментария с использованием мапы ключевых слов
 func parseMessage(message string) (address string, amount string, comment string, err error) {
 	if message == "" {
 		return "", "", "", errors.New("пустое сообщение")
 	}
 
-	// Разбиваем сообщение на строки
 	lines := strings.Split(message, "\n")
-	var addr, amt, comm string
+	var addr, amt, comm []string
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		// Используем регулярные выражения для более гибкого поиска
 		for field, keywords := range fieldKeywords {
 			for _, keyword := range keywords {
-				// Регулярное выражение для поиска "ключ: значение" с учётом синонимов и регистронезависимости
-				pattern := fmt.Sprintf(`(?i)^%s:\s*(.+)`, regexp.QuoteMeta(keyword))
+				pattern := fmt.Sprintf(`(?i)(%s|%s\s*[:=-])\s*(.+)`, regexp.QuoteMeta(keyword), regexp.QuoteMeta(keyword))
 				re := regexp.MustCompile(pattern)
 				matches := re.FindStringSubmatch(line)
-				if len(matches) == 2 {
+				if len(matches) == 3 {
+					value := strings.TrimSpace(matches[2])
 					switch field {
 					case "address":
-						addr = matches[1]
+						addr = append(addr, value)
 					case "amount":
-						amt = matches[1]
+						amt = append(amt, value)
 					case "comment":
-						comm = matches[1]
+						comm = append(comm, value)
 					}
-					break // Если найдено соответствие, не ищем дальше
+					break
 				}
 			}
 		}
 	}
 
-	// Проверка обязательных полей
-	if addr == "" || amt == "" {
+	if len(addr) == 0 || len(amt) == 0 {
 		return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
 	}
 
-	// Комментарий может быть пустым
-	return addr, amt, comm, nil
+	return strings.Join(addr, " "), strings.Join(amt, " "), strings.Join(comm, " "), nil
 }
 
-// sanitizeFileName удаляет или заменяет запрещенные символы из имени файла
 func sanitizeFileName(name string) string {
-	// Заменяем все символы, кроме букв, цифр и некоторых специальных символов, на подчёркивания
 	re := regexp.MustCompile(`[<>:"/\\|?*]+`)
 	return re.ReplaceAllString(name, "_")
 }
 
-// handlePhotoMessage обрабатывает сообщение с фотографией
-func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, driveFolderId string) {
-	// Получение комментария из сообщения
+func sendMessageToAdmin(bot *tgbotapi.BotAPI, adminID int64, message string) {
+	msg := tgbotapi.NewMessage(adminID, message)
+	_, err := bot.Send(msg)
+	if err != nil {
+		log.Printf("Ошибка при отправке сообщения админу: %v", err)
+	}
+}
+
+func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, driveFolderId string, adminID int64) {
 	comment := message.Caption
 
-	// Парсинг комментария
 	address, amount, commentText, parseErr := parseMessage(comment)
 	if parseErr != nil {
 		log.Printf("Ошибка при парсинге сообщения: %v", parseErr)
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так, проверьте правильность заполнения. Обратите внимание на шаблон сообщения и наличие фото.")
+		bot.Send(reply)
+		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при парсинге сообщения: %v", parseErr))
 		return
 	}
 
-	// Извлечение дополнительных данных
-	username := getFullName(message.From)
-	dateFormatted := time.Unix(int64(message.Date), 0).Format("02012006_150405")
+	loc, err := time.LoadLocation("Europe/Moscow")
+	if err != nil {
+		log.Printf("Ошибка при загрузке часового пояса: %v", err)
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Произошла внутренняя ошибка. Пожалуйста, попробуйте позже.")
+		bot.Send(reply)
+		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при загрузке часового пояса: %v", err))
+		return
+	}
 
-	// Получение файла из Telegram
+	username := getFullName(message.From)
+	moscowTime := time.Unix(int64(message.Date), 0).In(loc)
+	dateFormatted := moscowTime.Format("02/01/2006 15:04:05")
+
 	if len(message.Photo) == 0 {
 		log.Println("Сообщение не содержит фотографий")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так, проверьте наличие фотографии.")
+		bot.Send(reply)
+		sendMessageToAdmin(bot, adminID, "Пользователь отправил сообщение без фотографии")
 		return
 	}
 
-	// Выбираем фото с наибольшим разрешением (последнее в срезе)
 	photo := message.Photo[len(message.Photo)-1]
 	fileID := photo.FileID
 	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
 		log.Printf("Ошибка при получении файла: %v", err)
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при загрузке фотографии.")
+		bot.Send(reply)
+		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при получении файла: %v", err))
 		return
 	}
 
-	// Скачивание файла
 	fileURL := file.Link(bot.Token)
 	resp, err := http.Get(fileURL)
 	if err != nil {
 		log.Printf("Ошибка при скачивании файла: %v", err)
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при скачивании фотографии.")
+		bot.Send(reply)
+		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при скачивании файла: %v", err))
 		return
 	}
 	defer resp.Body.Close()
 
-	// Создание имени файла: "address_date.jpg"
 	sanitizedAddress := sanitizeFileName(address)
 	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, dateFormatted)
 
-	// Сохранение файла во временную директорию
 	tmpFile, err := ioutil.TempFile("", fileName)
 	if err != nil {
 		log.Printf("Не удалось создать временный файл: %v", err)
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при сохранении фотографии.")
+		bot.Send(reply)
+		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Не удалось создать временный файл: %v", err))
 		return
 	}
 	defer os.Remove(tmpFile.Name())
@@ -278,36 +278,44 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	_, err = io.Copy(tmpFile, resp.Body)
 	if err != nil {
 		log.Printf("Ошибка при сохранении файла: %v", err)
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при сохранении фотографии.")
+		bot.Send(reply)
+		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при сохранении файла: %v", err))
 		return
 	}
 
-	// Загрузка файла на Google Drive
 	driveLink, err := uploadFileToDrive(driveService, tmpFile.Name(), fileName, driveFolderId)
 	if err != nil {
 		log.Printf("Ошибка при загрузке файла на Drive: %v", err)
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при загрузке фотографии на Drive.")
+		bot.Send(reply)
+		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при загрузке файла на Google Drive: %v", err))
 		return
 	}
 
-	// Добавление данных в Google Sheets
 	parsedData := ParsedData{
 		Address:   address,
 		Amount:    amount,
 		Comment:   commentText,
 		Username:  username,
-		Date:      time.Unix(int64(message.Date), 0).Format("02/01/2006 15:04:05"),
+		Date:      dateFormatted,
 		DriveLink: driveLink,
 	}
 
 	err = appendToSheet(sheetsService, spreadsheetId, parsedData)
 	if err != nil {
 		log.Printf("Ошибка при записи в Google Sheets: %v", err)
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при записи данных в таблицу.")
+		bot.Send(reply)
+		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при записи в Google Sheets: %v", err))
 		return
 	}
 
+	reply := tgbotapi.NewMessage(message.Chat.ID, "Чек успешно добавлен в таблицу.")
+	bot.Send(reply)
 	log.Println("Данные успешно добавлены в Google Sheets и файл загружен на Drive")
 }
 
-// uploadFileToDrive загружает файл на Google Drive и возвращает ссылку
 func uploadFileToDrive(service *drive.Service, filePath, fileName, folderId string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -328,16 +336,13 @@ func uploadFileToDrive(service *drive.Service, filePath, fileName, folderId stri
 	return res.WebViewLink, nil
 }
 
-// appendToSheet добавляет строку данных в Google Sheets в столбцы B-G
 func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedData) error {
-	// Формирование значений для вставки
 	values := []interface{}{
-		data.Date,      // Столбец B
-		data.Username,  // Столбец C
-		data.Address,   // Столбец D
-		data.Amount,    // Столбец E
-		data.Comment,   // Столбец F (может быть пустым)
-		data.DriveLink, // Столбец G
+		data.Date,
+		data.Username, data.Address,
+		data.Amount,
+		data.Comment,
+		data.DriveLink,
 	}
 
 	vr := &sheets.ValueRange{
@@ -383,15 +388,19 @@ func main() {
 		log.Fatal("GOOGLE_DRIVE_FOLDER_ID не установлен в переменных окружения")
 	}
 
+	adminIDStr := os.Getenv("ADMIN_CHAT_ID")
+	if adminIDStr == "" {
+		log.Fatal("ADMIN_CHAT_ID не установлен в переменных окружения")
+	}
+	adminID, err := strconv.ParseInt(adminIDStr, 10, 64)
+	if err != nil {
+		log.Fatalf("Неверный формат ADMIN_CHAT_ID: %v", err)
+	}
+
 	googleClientID := os.Getenv("GOOGLE_OAUTH_CLIENT_ID")
 	googleClientSecret := os.Getenv("GOOGLE_OAUTH_CLIENT_SECRET")
 	if googleClientID == "" || googleClientSecret == "" {
 		log.Fatal("GOOGLE_OAUTH_CLIENT_ID и GOOGLE_OAUTH_CLIENT_SECRET должны быть установлены в переменных окружения")
-	}
-
-	serverAddr := os.Getenv("SERVER_ADDR")
-	if serverAddr == "" {
-		serverAddr = ":8080"
 	}
 
 	// Настройка OAuth2 конфигурации
@@ -462,15 +471,36 @@ func main() {
 				return
 			}
 
-			if update.Message != nil && update.Message.Photo != nil {
-				// Ограничение количества горутин с использованием семафора
-				semaphore <- struct{}{} // Блокируем, если достигнуто максимальное количество горутин
-				wg.Add(1)
-				go func(message *tgbotapi.Message) {
-					defer wg.Done()
-					handlePhotoMessage(bot, message, sheetsService, spreadsheetId, driveService, driveFolderId)
-					<-semaphore // Освобождаем место в канале
-				}(update.Message)
+			if update.Message != nil {
+				if update.Message.IsCommand() {
+					switch update.Message.Command() {
+					case "start", "help":
+						helpText := `Привет! Я бот для добавления чеков в таблицу. Вот как меня использовать:
+
+1. Отправьте фотографию чека
+2. В подписи к фото укажите:
+   - Адрес: [адрес]
+   - Сумма: [сумма]
+   - Комментарий: [ваш комментарий] (необязательно)
+
+Пример:
+Адрес: ул. Пушкина, д. 10
+Сумма: 1500 руб
+Комментарий: Оплата за сентябрь`
+
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, helpText)
+						bot.Send(msg)
+					}
+				} else if update.Message.Photo != nil {
+					// Ограничение количества горутин с использованием семафора
+					semaphore <- struct{}{} // Блокируем, если достигнуто максимальное количество горутин
+					wg.Add(1)
+					go func(message *tgbotapi.Message) {
+						defer wg.Done()
+						handlePhotoMessage(bot, message, sheetsService, spreadsheetId, driveService, driveFolderId, adminID)
+						<-semaphore // Освобождаем место в канале
+					}(update.Message)
+				}
 			}
 
 			w.WriteHeader(http.StatusOK)
@@ -487,9 +517,13 @@ func main() {
 
 	// Запуск HTTP-сервера
 	log.Printf("Запуск HTTP сервера на порту %s", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatalf("Ошибка запуска HTTP сервера: %v", err)
-	}
+	server := &http.Server{Addr: ":" + port}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Ошибка запуска HTTP сервера: %v", err)
+		}
+	}()
 
 	// Создание канала для получения сигналов ОС
 	quit := make(chan os.Signal, 1)
@@ -507,6 +541,13 @@ func main() {
 		log.Printf("Не удалось удалить Webhook: %v", err)
 	} else {
 		log.Println("Webhook удален")
+	}
+
+	// Graceful shutdown HTTP-сервера
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Ошибка при остановке HTTP-сервера: %v", err)
 	}
 
 	// Ожидание завершения всех горутин обработки сообщений
