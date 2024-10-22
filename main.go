@@ -219,18 +219,12 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 		return
 	}
 
-	loc, err := time.LoadLocation("Europe/Moscow")
-	if err != nil {
-		log.Printf("Ошибка при загрузке часового пояса: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Произошла внутренняя ошибка. Пожалуйста, попробуйте позже.")
-		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при загрузке часового пояса: %v", err))
-		return
-	}
+	// Изменяем способ работы с временной зоной
+	moscowOffset := int((3 * time.Hour).Seconds())
+	moscowTime := time.Unix(int64(message.Date), 0).UTC().Add(time.Duration(moscowOffset) * time.Second)
+	dateFormatted := moscowTime.Format("02/01/2006 15:04:05")
 
 	username := getFullName(message.From)
-	moscowTime := time.Unix(int64(message.Date), 0).In(loc)
-	dateFormatted := moscowTime.Format("02/01/2006 15:04:05")
 
 	if len(message.Photo) == 0 {
 		log.Println("Сообщение не содержит фотографий")
@@ -451,9 +445,12 @@ func main() {
 		log.Fatalf("Неверный формат WEBHOOK_URL: %v", err)
 	}
 
-	_, err = bot.Request(tgbotapi.WebhookConfig{
-		URL: url,
-	})
+	// Устанавливаем webhook без возможности его удаления
+	webhookConfig := tgbotapi.WebhookConfig{
+		URL:            url,
+		MaxConnections: 40,
+	}
+	_, err = bot.Request(webhookConfig)
 	if err != nil {
 		log.Fatalf("Не удалось установить Webhook: %v", err)
 	}
@@ -492,13 +489,12 @@ func main() {
 						bot.Send(msg)
 					}
 				} else if update.Message.Photo != nil {
-					// Ограничение количества горутин с использованием семафора
-					semaphore <- struct{}{} // Блокируем, если достигнуто максимальное количество горутин
+					semaphore <- struct{}{}
 					wg.Add(1)
 					go func(message *tgbotapi.Message) {
 						defer wg.Done()
 						handlePhotoMessage(bot, message, sheetsService, spreadsheetId, driveService, driveFolderId, adminID)
-						<-semaphore // Освобождаем место в канале
+						<-semaphore
 					}(update.Message)
 				}
 			}
@@ -509,10 +505,10 @@ func main() {
 		}
 	})
 
-	// Получение порта из переменных окружения Railway
+	// Получение порта из переменных окружения
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080" // Порт по умолчанию, если не задан в переменных окружения
+		port = "8080"
 	}
 
 	// Запуск HTTP-сервера
@@ -529,29 +525,19 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
-	// Ожидание сигнала завершения (например, Ctrl+C)
+	// Ожидание сигнала завершения
 	<-quit
-	log.Println("Получен сигнал завершения, останавливаем бота...")
+	log.Println("Получен сигнал завершения, останавливаем сервер...")
 
-	// Удаление Webhook
-	_, err = bot.Request(tgbotapi.DeleteWebhookConfig{
-		DropPendingUpdates: true,
-	})
-	if err != nil {
-		log.Printf("Не удалось удалить Webhook: %v", err)
-	} else {
-		log.Println("Webhook удален")
-	}
-
-	// Graceful shutdown HTTP-сервера
+	// Graceful shutdown только HTTP-сервера, без удаления webhook
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("Ошибка при остановке HTTP-сервера: %v", err)
 	}
 
-	// Ожидание завершения всех горутин обработки сообщений
+	// Ожидание завершения всех горутин
 	wg.Wait()
 
-	log.Println("Бот успешно остановлен.")
+	log.Println("Сервер успешно остановлен.")
 }
