@@ -37,9 +37,9 @@ type ParsedData struct {
 }
 
 var fieldKeywords = map[string][]string{
-	"address": {"адрес", "объект", "квартира", "школа", "дом", "улица"},
-	"amount":  {"сумма", "стоимость", "оплата", "платёж"},
-	"comment": {"комментарий", "коммент", "прим", "примечание", "дополнение"},
+	"address": {"адрес", "объект", "квартира", "школа", "дом", "улица", "место", "локация"},
+	"amount":  {"сумма", "стоимость", "оплата", "платёж", "цена"},
+	"comment": {"комментарий", "коммент", "прим", "примечание", "дополнение", "заметка"},
 }
 
 var (
@@ -166,23 +166,52 @@ func parseMessage(message string) (address string, amount string, comment string
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Флаг, показывающий, была ли найдена информация в этой строке
+		found := false
+
+		// Сначала проверяем формат "Ключ: значение" или "Ключ - значение"
 		for field, keywords := range fieldKeywords {
 			for _, keyword := range keywords {
-				pattern := fmt.Sprintf(`(?i)(%s|%s\s*[:=-])\s*(.+)`, regexp.QuoteMeta(keyword), regexp.QuoteMeta(keyword))
-				re := regexp.MustCompile(pattern)
-				matches := re.FindStringSubmatch(line)
-				if len(matches) == 3 {
-					value := strings.TrimSpace(matches[2])
-					switch field {
-					case "address":
-						addr = append(addr, value)
-					case "amount":
-						amt = append(amt, value)
-					case "comment":
-						comm = append(comm, value)
+				// Расширенный паттерн для поиска
+				patterns := []string{
+					// Стандартный формат с разделителями
+					fmt.Sprintf(`(?i)(%s\s*[:=-])\s*(.+)`, regexp.QuoteMeta(keyword)),
+					// Формат без разделителей, но с пробелом после ключевого слова
+					fmt.Sprintf(`(?i)^%s\s+(.+)`, regexp.QuoteMeta(keyword)),
+				}
+
+				for _, pattern := range patterns {
+					re := regexp.MustCompile(pattern)
+					matches := re.FindStringSubmatch(line)
+					if len(matches) > 0 {
+						// Получаем значение из последней группы
+						value := strings.TrimSpace(matches[len(matches)-1])
+						if value != "" {
+							switch field {
+							case "address":
+								addr = append(addr, value)
+							case "amount":
+								// Очищаем сумму от лишних символов
+								value = cleanAmount(value)
+								amt = append(amt, value)
+							case "comment":
+								comm = append(comm, value)
+							}
+							found = true
+							break
+						}
 					}
+				}
+				if found {
 					break
 				}
+			}
+			if found {
+				break
 			}
 		}
 	}
@@ -192,6 +221,18 @@ func parseMessage(message string) (address string, amount string, comment string
 	}
 
 	return strings.Join(addr, " "), strings.Join(amt, " "), strings.Join(comm, " "), nil
+}
+
+// Вспомогательная функция для очистки суммы
+func cleanAmount(amount string) string {
+	// Удаляем все символы кроме цифр, точки и запятой
+	re := regexp.MustCompile(`[^0-9.,]`)
+	cleaned := re.ReplaceAllString(amount, "")
+
+	// Заменяем запятую на точку, если она есть
+	cleaned = strings.ReplaceAll(cleaned, ",", ".")
+
+	return cleaned
 }
 
 func sanitizeFileName(name string) string {
@@ -220,7 +261,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	address, amount, commentText, parseErr := parseMessage(comment)
 	if parseErr != nil {
 		log.Printf("Ошибка при парсинге сообщения: %v", parseErr)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так, проверьте правильность заполнения. Обратите внимание на шаблон сообщения и наличие фото.")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так, проверьте правильность заполнения. Обратите внимание на шаблон сообщения и наличие фото. Попробуйте /start чтобы посмотреть справку.")
 		bot.Send(reply)
 		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при парсинге сообщения: %v", parseErr))
 		return
@@ -235,7 +276,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 
 	if len(message.Photo) == 0 {
 		log.Println("Сообщение не содержит фотографий")
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так, проверьте наличие фотографии.")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так, проверьте наличие фотографии. Попробуйте /start чтобы посмотреть справку.")
 		bot.Send(reply)
 		sendMessageToAdmin(bot, adminID, "Пользователь отправил сообщение без фотографии")
 		return
@@ -246,7 +287,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
 		log.Printf("Ошибка при получении файла: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при загрузке фотографии.")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при загрузке фотографии. Попробуйте /start чтобы посмотреть справку.")
 		bot.Send(reply)
 		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при получении файла: %v", err))
 		return
@@ -256,7 +297,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	resp, err := http.Get(fileURL)
 	if err != nil {
 		log.Printf("Ошибка при скачивании файла: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при скачивании фотографии.")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при скачивании фотографии. Попробуйте /start чтобы посмотреть справку.")
 		bot.Send(reply)
 		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при скачивании файла: %v", err))
 		return
@@ -272,7 +313,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	tmpFile, err := ioutil.TempFile("", "receipt_*_"+fileName)
 	if err != nil {
 		log.Printf("Не удалось создать временный файл: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при сохранении фотографии.")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при сохранении фотографии. Попробуйте /start чтобы посмотреть справку.")
 		bot.Send(reply)
 		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Не удалось создать временный файл: %v", err))
 		return
@@ -282,7 +323,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	_, err = io.Copy(tmpFile, resp.Body)
 	if err != nil {
 		log.Printf("Ошибка при сохранении файла: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при сохранении фотографии.")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при сохранении фотографии. Попробуйте /start чтобы посмотреть справку.")
 		bot.Send(reply)
 		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при сохранении файла: %v", err))
 		return
@@ -291,7 +332,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	driveLink, err := uploadFileToDrive(driveService, tmpFile.Name(), fileName, driveFolderId)
 	if err != nil {
 		log.Printf("Ошибка при загрузке файла на Drive: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при загрузке фотографии на Drive.")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при загрузке фотографии на Drive. Попробуйте /start чтобы посмотреть справку.")
 		bot.Send(reply)
 		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при загрузке файла на Google Drive: %v", err))
 		return
@@ -309,7 +350,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	err = appendToSheet(sheetsService, spreadsheetId, parsedData)
 	if err != nil {
 		log.Printf("Ошибка при записи в Google Sheets: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при записи данных в таблицу.")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при записи данных в таблицу. Попробуйте /start чтобы посмотреть справку.")
 		bot.Send(reply)
 		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при записи в Google Sheets: %v", err))
 		return
@@ -500,14 +541,26 @@ func main() {
 
 1. Отправьте фотографию чека
 2. В подписи к фото укажите:
-   - Адрес: [адрес]
-   - Сумма: [сумма]
-   - Комментарий: [ваш комментарий] (необязательно)
+   Вариант 1:
+   Адрес: [адрес]
+   Сумма: [сумма]
+   Комментарий: [ваш комментарий] (необязательно)
 
-Пример:
+   Вариант 2:
+   Адрес [адрес]
+   Сумма [сумма]
+   Комментарий [ваш комментарий] (необязательно)
+
+Примеры:
+Вариант 1:
 Адрес: ул. Пушкина, д. 10
 Сумма: 1500 руб
-Комментарий: Оплата за сентябрь`
+Комментарий: Оплата за сентябрь
+
+Вариант 2:
+Адрес ул. Пушкина, д. 10
+Сумма 1500 руб
+Комментарий Оплата за сентябрь`
 
 						msg := tgbotapi.NewMessage(update.Message.Chat.ID, helpText)
 						bot.Send(msg)
