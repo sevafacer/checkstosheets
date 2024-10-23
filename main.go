@@ -195,14 +195,21 @@ func parseMessage(message string) (address string, amount string, comment string
 }
 
 func sanitizeFileName(name string) string {
-	re := regexp.MustCompile(`[<>:"/\\|?*]+`)
-	return re.ReplaceAllString(name, "_")
+	re := regexp.MustCompile(`[^a-zA-Z0-9.-]`)
+	sanitized := re.ReplaceAllString(name, "_")
+	multipleUnderscore := regexp.MustCompile(`_+`)
+	sanitized = multipleUnderscore.ReplaceAllString(sanitized, "_")
+	return sanitized
 }
 
 func sendMessageToAdmin(bot *tgbotapi.BotAPI, adminID int64, message string) {
 	msg := tgbotapi.NewMessage(adminID, message)
 	_, err := bot.Send(msg)
 	if err != nil {
+		if strings.Contains(err.Error(), "bot can't initiate conversation with a user") {
+			log.Printf("Администратор должен начать диалог с ботом первым: /start")
+			return
+		}
 		log.Printf("Ошибка при отправке сообщения админу: %v", err)
 	}
 }
@@ -257,9 +264,12 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	defer resp.Body.Close()
 
 	sanitizedAddress := sanitizeFileName(address)
-	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, dateFormatted)
+	dateStr := strings.ReplaceAll(dateFormatted, "/", "_")
+	dateStr = strings.ReplaceAll(dateStr, " ", "_")
+	dateStr = strings.ReplaceAll(dateStr, ":", "_")
+	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, dateStr)
 
-	tmpFile, err := ioutil.TempFile("", fileName)
+	tmpFile, err := ioutil.TempFile("", "receipt_*_"+fileName)
 	if err != nil {
 		log.Printf("Не удалось создать временный файл: %v", err)
 		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при сохранении фотографии.")
@@ -365,6 +375,20 @@ func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedDat
 	return nil
 }
 
+func keepAlive(webhookURL string) {
+	ticker := time.NewTicker(10 * time.Minute)
+	go func() {
+		for range ticker.C {
+			resp, err := http.Get(webhookURL)
+			if err != nil {
+				log.Printf("Ошибка при выполнении keepalive запроса: %v", err)
+				continue
+			}
+			resp.Body.Close()
+		}
+	}()
+}
+
 func main() {
 	// Чтение переменных окружения
 	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
@@ -455,7 +479,7 @@ func main() {
 		log.Fatalf("Не удалось установить Webhook: %v", err)
 	}
 	log.Printf("Webhook установлен на %s", webhookURL)
-
+	keepAlive(webhookURL)
 	// Обработчик для входящих обновлений
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
