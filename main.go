@@ -280,11 +280,11 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 
 	username := getFullName(message.From)
 
-	if message.Photo == nil || len(message.Photo) == 0 {
-		log.Println("Сообщение не содержит фотографий")
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так, проверьте наличие фотографии. Попробуйте /start чтобы посмотреть справку.")
+	if message.Photo == nil && message.Video == nil && message.Document == nil {
+		log.Println("Сообщение не содержит медиа")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Пожалуйста, прикрепите медиа файл (фото, видео или документ).")
 		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, "Пользователь отправил сообщение без фотографии")
+		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Пользователь %s отправил сообщение без медиа", getFullName(message.From)))
 		return
 	}
 
