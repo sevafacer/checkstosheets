@@ -568,7 +568,7 @@ func main() {
 					msg := tgbotapi.NewMessage(update.Message.Chat.ID, helpText)
 					bot.Send(msg)
 				}
-			} else if update.Message.Photo != nil {
+			} else {
 				semaphore <- struct{}{}
 				wg.Add(1)
 				go func(message *tgbotapi.Message) {
