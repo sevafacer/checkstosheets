@@ -257,6 +257,12 @@ func sendMessageToAdmin(bot *tgbotapi.BotAPI, adminID int64, message string) {
 
 func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, driveFolderId string, adminID int64) {
 	comment := message.Caption
+	if comment == "" {
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Пожалуйста, добавьте описание к фотографии. Используйте /help для просмотра формата.")
+		bot.Send(reply)
+		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Пользователь %s отправил фото без описания", getFullName(message.From)))
+		return
+	}
 
 	address, amount, commentText, parseErr := parseMessage(comment)
 	if parseErr != nil {
