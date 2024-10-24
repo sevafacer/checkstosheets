@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,41 +54,88 @@ const maxGoroutines = 10
 
 var semaphore = make(chan struct{}, maxGoroutines)
 
-func saveTokenToSecrets(token *oauth2.Token) error {
-	tokenJSON, err := json.Marshal(token)
-	if err != nil {
-		return fmt.Errorf("не удалось сериализовать токен: %v", err)
+// Структура для хранения токена
+type TokenInfo struct {
+	AccessToken  string    `json:"access_token"`
+	TokenType    string    `json:"token_type"`
+	RefreshToken string    `json:"refresh_token"`
+	Expiry       time.Time `json:"expiry"`
+}
+
+// Функция для сохранения токена в переменные окружения Railway
+func saveTokenToEnv(token *oauth2.Token) error {
+	tokenInfo := TokenInfo{
+		AccessToken:  token.AccessToken,
+		TokenType:    token.TokenType,
+		RefreshToken: token.RefreshToken,
+		Expiry:       token.Expiry,
 	}
 
-	err = os.Setenv("GOOGLE_OAUTH_TOKEN", string(tokenJSON))
+	tokenJSON, err := json.Marshal(tokenInfo)
 	if err != nil {
-		return fmt.Errorf("не удалось сохранить токен в переменных среды: %v", err)
+		return fmt.Errorf("ошибка маршалинга токена: %v", err)
+	}
+
+	// Сохраняем токен в переменную окружения
+	err = os.Setenv("GOOGLE_OAUTH_TOKEN", base64.StdEncoding.EncodeToString(tokenJSON))
+	if err != nil {
+		return fmt.Errorf("ошибка сохранения токена: %v", err)
 	}
 
 	return nil
 }
 
-func loadTokenFromSecrets() (*oauth2.Token, error) {
-	tokenJSON := os.Getenv("GOOGLE_OAUTH_TOKEN")
-	if tokenJSON == "" {
-		return nil, errors.New("токен не найден в переменных среды")
+// Функция для загрузки токена из переменных окружения
+func loadTokenFromEnv() (*oauth2.Token, error) {
+	tokenStr := os.Getenv("GOOGLE_OAUTH_TOKEN")
+	if tokenStr == "" {
+		return nil, fmt.Errorf("токен не найден в переменных окружения")
 	}
 
-	var token oauth2.Token
-	err := json.Unmarshal([]byte(tokenJSON), &token)
+	// Декодируем base64
+	tokenJSON, err := base64.StdEncoding.DecodeString(tokenStr)
 	if err != nil {
-		return nil, fmt.Errorf("не удалось десериализовать токен: %v", err)
+		return nil, fmt.Errorf("ошибка декодирования токена: %v", err)
 	}
 
-	return &token, nil
+	var tokenInfo TokenInfo
+	if err := json.Unmarshal(tokenJSON, &tokenInfo); err != nil {
+		return nil, fmt.Errorf("ошибка анмаршалинга токена: %v", err)
+	}
+
+	return &oauth2.Token{
+		AccessToken:  tokenInfo.AccessToken,
+		TokenType:    tokenInfo.TokenType,
+		RefreshToken: tokenInfo.RefreshToken,
+		Expiry:       tokenInfo.Expiry,
+	}, nil
 }
 
+// Обновлённая функция получения клиента
 func getClient(config *oauth2.Config) (*http.Client, error) {
-	token, err := loadTokenFromSecrets()
+	// Пытаемся загрузить существующий токен
+	token, err := loadTokenFromEnv()
 	if err == nil {
-		return config.Client(context.Background(), token), nil
+		// Проверяем, действителен ли токен
+		if token.Valid() {
+			return config.Client(context.Background(), token), nil
+		}
+
+		// Если токен истёк, пробуем его обновить
+		if token.RefreshToken != "" {
+			newToken, err := config.TokenSource(context.Background(), token).Token()
+			if err == nil {
+				// Сохраняем обновлённый токен
+				if err := saveTokenToEnv(newToken); err != nil {
+					log.Printf("Ошибка сохранения обновлённого токена: %v", err)
+				}
+				return config.Client(context.Background(), newToken), nil
+			}
+			log.Printf("Ошибка обновления токена: %v", err)
+		}
 	}
 
+	// Если токен не найден или не удалось обновить, запускаем процесс авторизации
 	serverErrCh := make(chan error, 1)
 	server := startOAuthServer(serverErrCh)
 
@@ -96,28 +144,28 @@ func getClient(config *oauth2.Config) (*http.Client, error) {
 
 	select {
 	case code := <-authCodeCh:
-		tok, err := config.Exchange(context.Background(), code)
+		token, err := config.Exchange(context.Background(), code)
 		if err != nil {
-			return nil, fmt.Errorf("не удалось обменять код на токен: %v", err)
+			return nil, fmt.Errorf("ошибка обмена кода на токен: %v", err)
 		}
 
-		err = saveTokenToSecrets(tok)
-		if err != nil {
-			return nil, fmt.Errorf("не удалось сохранить токен в секретах: %v", err)
+		// Сохраняем новый токен
+		if err := saveTokenToEnv(token); err != nil {
+			log.Printf("Ошибка сохранения нового токена: %v", err)
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
-			log.Printf("Ошибка при завершении работы OAuth2 сервера: %v", err)
+			log.Printf("Ошибка при остановке OAuth сервера: %v", err)
 		}
-		return config.Client(context.Background(), tok), nil
+
+		return config.Client(context.Background(), token), nil
 
 	case err := <-serverErrCh:
-		return nil, fmt.Errorf("сервер OAuth2 завершился с ошибкой: %v", err)
+		return nil, fmt.Errorf("ошибка OAuth сервера: %v", err)
 	}
 }
-
 func startOAuthServer(errCh chan<- error) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -256,6 +304,16 @@ func sendMessageToAdmin(bot *tgbotapi.BotAPI, adminID int64, message string) {
 }
 
 func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, driveFolderId string, adminID int64) {
+	// Сначала проверяем наличие медиа файла
+	if message.Photo == nil && message.Video == nil && message.Document == nil {
+		log.Println("Сообщение не содержит медиа")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Пожалуйста, прикрепите фотографию чека. Используйте /help для просмотра формата.")
+		bot.Send(reply)
+		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Пользователь %s отправил сообщение без медиа файла", getFullName(message.From)))
+		return
+	}
+
+	// Затем проверяем наличие описания
 	comment := message.Caption
 	if comment == "" {
 		reply := tgbotapi.NewMessage(message.Chat.ID, "Пожалуйста, добавьте описание к фотографии. Используйте /help для просмотра формата.")
@@ -279,14 +337,6 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	dateFormatted := moscowTime.Format("02/01/2006 15:04:05")
 
 	username := getFullName(message.From)
-
-	if message.Photo == nil && message.Video == nil && message.Document == nil {
-		log.Println("Сообщение не содержит медиа")
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Пожалуйста, прикрепите медиа файл (фото, видео или документ).")
-		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Пользователь %s отправил сообщение без медиа", getFullName(message.From)))
-		return
-	}
 
 	photo := message.Photo[len(message.Photo)-1]
 	fileID := photo.FileID

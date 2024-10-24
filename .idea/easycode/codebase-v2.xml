@@ -2,5 +2,8 @@
 <project version="4">
   <component name="com.obiscr.chatgpt.settings.EasyCodeState">
     <option name="projectFiles" value="$PROJECT_DIR$/main.go;/Users/vsevolodsolovev/Desktop/checkbot/README.md" />
+    <option name="forceFullIndex" value="false" />
+    <option name="fileSummaryMaps" value="{&quot;/Users/vsevolodsolovev/Desktop/checkbot&quot;:&quot;{}&quot;}" />
+    <option name="fileSkeletonMaps" value="{&quot;/Users/vsevolodsolovev/Desktop/checkbot&quot;:&quot;{\&quot;/main.go\&quot;:{\&quot;file_path\&quot;:\&quot;/main.go\&quot;,\&quot;file_name\&quot;:\&quot;main.go\&quot;,\&quot;methods\&quot;:[]},\&quot;/README.md\&quot;:{\&quot;file_path\&quot;:\&quot;/README.md\&quot;,\&quot;file_name\&quot;:\&quot;README.md\&quot;,\&quot;methods\&quot;:[]}}&quot;}" />
   </component>
 </project>
