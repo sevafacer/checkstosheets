@@ -576,7 +576,7 @@ func main() {
 		log.Fatalf("Не удалось установить Webhook: %v", err)
 	}
 	log.Printf("Webhook установлен на %s", webhookURL)
-	// keepAlive(webhookURL)
+	keepAlive(webhookURL)
 	// Обработчик для входящих обновлений
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
