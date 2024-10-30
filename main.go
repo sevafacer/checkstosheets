@@ -292,10 +292,17 @@ func parseMessage(message string) (address string, amount string, comment string
 func cleanAmount(amount string) string {
 	re := regexp.MustCompile(`[^0-9.,]`)
 	cleaned := re.ReplaceAllString(amount, "")
-
 	cleaned = strings.ReplaceAll(cleaned, ",", ".")
 
-	return cleaned
+	// Convert the string to a float for proper formatting (optional)
+	amountFloat, err := strconv.ParseFloat(cleaned, 64)
+	if err != nil {
+		log.Printf("Ошибка при преобразовании суммы: %v", err)
+		return cleaned // Return the cleaned string if conversion fails
+	}
+
+	// Format as currency with Russian rubles
+	return fmt.Sprintf("%.2f ₽", amountFloat)
 }
 
 func sanitizeFileName(name string) string {
