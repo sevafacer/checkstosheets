@@ -54,7 +54,6 @@ const maxGoroutines = 10
 
 var semaphore = make(chan struct{}, maxGoroutines)
 
-// Структура для хранения токена
 type TokenInfo struct {
 	AccessToken  string    `json:"access_token"`
 	TokenType    string    `json:"token_type"`
@@ -62,8 +61,17 @@ type TokenInfo struct {
 	Expiry       time.Time `json:"expiry"`
 }
 
-// Функция для сохранения токена в переменные окружения Railway
+const (
+	maxRetries         = 3
+	retryDelay         = 2
+	tokenRefreshWindow = 5 * time.Minute
+)
+
 func saveTokenToEnv(token *oauth2.Token) error {
+	if token == nil {
+		return fmt.Errorf("попытка сохранить пустой токен")
+	}
+
 	tokenInfo := TokenInfo{
 		AccessToken:  token.AccessToken,
 		TokenType:    token.TokenType,
@@ -71,28 +79,28 @@ func saveTokenToEnv(token *oauth2.Token) error {
 		Expiry:       token.Expiry,
 	}
 
+	if token.RefreshToken == "" && os.Getenv("GOOGLE_OAUTH_TOKEN") != "" {
+		oldToken, err := loadTokenFromEnv()
+		if err == nil && oldToken.RefreshToken != "" {
+			tokenInfo.RefreshToken = oldToken.RefreshToken
+		}
+	}
+
 	tokenJSON, err := json.Marshal(tokenInfo)
 	if err != nil {
 		return fmt.Errorf("ошибка маршалинга токена: %v", err)
 	}
 
-	// Сохраняем токен в переменную окружения
-	err = os.Setenv("GOOGLE_OAUTH_TOKEN", base64.StdEncoding.EncodeToString(tokenJSON))
-	if err != nil {
-		return fmt.Errorf("ошибка сохранения токена: %v", err)
-	}
-
-	return nil
+	encodedToken := base64.StdEncoding.EncodeToString(tokenJSON)
+	return os.Setenv("GOOGLE_OAUTH_TOKEN", encodedToken)
 }
 
-// Функция для загрузки токена из переменных окружения
 func loadTokenFromEnv() (*oauth2.Token, error) {
 	tokenStr := os.Getenv("GOOGLE_OAUTH_TOKEN")
 	if tokenStr == "" {
 		return nil, fmt.Errorf("токен не найден в переменных окружения")
 	}
 
-	// Декодируем base64
 	tokenJSON, err := base64.StdEncoding.DecodeString(tokenStr)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка декодирования токена: %v", err)
@@ -103,43 +111,63 @@ func loadTokenFromEnv() (*oauth2.Token, error) {
 		return nil, fmt.Errorf("ошибка анмаршалинга токена: %v", err)
 	}
 
-	return &oauth2.Token{
+	token := &oauth2.Token{
 		AccessToken:  tokenInfo.AccessToken,
 		TokenType:    tokenInfo.TokenType,
 		RefreshToken: tokenInfo.RefreshToken,
 		Expiry:       tokenInfo.Expiry,
-	}, nil
+	}
+
+	return token, nil
 }
 
-// Обновлённая функция получения клиента
-func getClient(config *oauth2.Config) (*http.Client, error) {
-	// Пытаемся загрузить существующий токен
-	token, err := loadTokenFromEnv()
-	if err == nil {
-		// Проверяем, действителен ли токен
-		if token.Valid() {
-			return config.Client(context.Background(), token), nil
+func refreshToken(config *oauth2.Config, token *oauth2.Token) (*oauth2.Token, error) {
+	for i := 0; i < maxRetries; i++ {
+		tokenSource := config.TokenSource(context.Background(), token)
+		newToken, err := tokenSource.Token()
+		if err == nil {
+			if newToken.RefreshToken == "" {
+				newToken.RefreshToken = token.RefreshToken
+			}
+			return newToken, nil
 		}
 
-		// Если токен истёк, пробуем его обновить
-		if token.RefreshToken != "" {
-			newToken, err := config.TokenSource(context.Background(), token).Token()
-			if err == nil {
-				// Сохраняем обновлённый токен
-				if err := saveTokenToEnv(newToken); err != nil {
-					log.Printf("Ошибка сохранения обновлённого токена: %v", err)
+		log.Printf("Попытка %d обновления токена не удалась: %v", i+1, err)
+		time.Sleep(time.Duration(retryDelay*(i+1)) * time.Second)
+	}
+	return nil, fmt.Errorf("не удалось обновить токен после %d попыток", maxRetries)
+}
+
+func getClient(config *oauth2.Config) (*http.Client, error) {
+	token, err := loadTokenFromEnv()
+	if err == nil {
+		if time.Until(token.Expiry) < tokenRefreshWindow {
+			if token.RefreshToken != "" {
+				newToken, err := refreshToken(config, token)
+				if err == nil {
+					if err := saveTokenToEnv(newToken); err != nil {
+						log.Printf("Предупреждение: не удалось сохранить обновлённый токен: %v", err)
+					}
+					return config.Client(context.Background(), newToken), nil
 				}
-				return config.Client(context.Background(), newToken), nil
+				log.Printf("Предупреждение: не удалось обновить токен: %v", err)
 			}
-			log.Printf("Ошибка обновления токена: %v", err)
+		} else if token.Valid() {
+			return config.Client(context.Background(), token), nil
 		}
 	}
 
-	// Если токен не найден или не удалось обновить, запускаем процесс авторизации
 	serverErrCh := make(chan error, 1)
 	server := startOAuthServer(serverErrCh)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Ошибка при остановке OAuth сервера: %v", err)
+		}
+	}()
 
-	authURL := config.AuthCodeURL(oauthState, oauth2.AccessTypeOffline)
+	authURL := config.AuthCodeURL(oauthState, oauth2.AccessTypeOffline, oauth2.ApprovalForce)
 	fmt.Printf("Перейдите по ссылке для авторизации:\n%v\n", authURL)
 
 	select {
@@ -149,23 +177,20 @@ func getClient(config *oauth2.Config) (*http.Client, error) {
 			return nil, fmt.Errorf("ошибка обмена кода на токен: %v", err)
 		}
 
-		// Сохраняем новый токен
 		if err := saveTokenToEnv(token); err != nil {
-			log.Printf("Ошибка сохранения нового токена: %v", err)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(ctx); err != nil {
-			log.Printf("Ошибка при остановке OAuth сервера: %v", err)
+			log.Printf("Предупреждение: не удалось сохранить новый токен: %v", err)
 		}
 
 		return config.Client(context.Background(), token), nil
 
 	case err := <-serverErrCh:
 		return nil, fmt.Errorf("ошибка OAuth сервера: %v", err)
+
+	case <-time.After(5 * time.Minute):
+		return nil, fmt.Errorf("превышено время ожидания авторизации")
 	}
 }
+
 func startOAuthServer(errCh chan<- error) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -218,17 +243,12 @@ func parseMessage(message string) (address string, amount string, comment string
 			continue
 		}
 
-		// Флаг, показывающий, была ли найдена информация в этой строке
 		found := false
 
-		// Сначала проверяем формат "Ключ: значение" или "Ключ - значение"
 		for field, keywords := range fieldKeywords {
 			for _, keyword := range keywords {
-				// Расширенный паттерн для поиска
 				patterns := []string{
-					// Стандартный формат с разделителями
 					fmt.Sprintf(`(?i)(%s\s*[:=-])\s*(.+)`, regexp.QuoteMeta(keyword)),
-					// Формат без разделителей, но с пробелом после ключевого слова
 					fmt.Sprintf(`(?i)^%s\s+(.+)`, regexp.QuoteMeta(keyword)),
 				}
 
@@ -236,14 +256,12 @@ func parseMessage(message string) (address string, amount string, comment string
 					re := regexp.MustCompile(pattern)
 					matches := re.FindStringSubmatch(line)
 					if len(matches) > 0 {
-						// Получаем значение из последней группы
 						value := strings.TrimSpace(matches[len(matches)-1])
 						if value != "" {
 							switch field {
 							case "address":
 								addr = append(addr, value)
 							case "amount":
-								// Очищаем сумму от лишних символов
 								value = cleanAmount(value)
 								amt = append(amt, value)
 							case "comment":
@@ -271,13 +289,10 @@ func parseMessage(message string) (address string, amount string, comment string
 	return strings.Join(addr, " "), strings.Join(amt, " "), strings.Join(comm, " "), nil
 }
 
-// Вспомогательная функция для очистки суммы
 func cleanAmount(amount string) string {
-	// Удаляем все символы кроме цифр, точки и запятой
 	re := regexp.MustCompile(`[^0-9.,]`)
 	cleaned := re.ReplaceAllString(amount, "")
 
-	// Заменяем запятую на точку, если она есть
 	cleaned = strings.ReplaceAll(cleaned, ",", ".")
 
 	return cleaned
@@ -304,7 +319,6 @@ func sendMessageToAdmin(bot *tgbotapi.BotAPI, adminID int64, message string) {
 }
 
 func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, driveFolderId string, adminID int64) {
-	// Сначала проверяем наличие медиа файла
 	if message.Photo == nil && message.Video == nil && message.Document == nil {
 		log.Println("Сообщение не содержит медиа")
 		reply := tgbotapi.NewMessage(message.Chat.ID, "Пожалуйста, прикрепите фотографию чека. Используйте /help для просмотра формата.")
@@ -313,7 +327,6 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 		return
 	}
 
-	// Затем проверяем наличие описания
 	comment := message.Caption
 	if comment == "" {
 		reply := tgbotapi.NewMessage(message.Chat.ID, "Пожалуйста, добавьте описание к фотографии. Используйте /help для просмотра формата.")
@@ -331,7 +344,6 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 		return
 	}
 
-	// Изменяем способ работы с временной зоной
 	moscowOffset := int((3 * time.Hour).Seconds())
 	moscowTime := time.Unix(int64(message.Date), 0).UTC().Add(time.Duration(moscowOffset) * time.Second)
 	dateFormatted := moscowTime.Format("02/01/2006 15:04:05")
@@ -418,23 +430,46 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 }
 
 func uploadFileToDrive(service *drive.Service, filePath, fileName, folderId string) (string, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return "", fmt.Errorf("не удалось открыть файл для загрузки: %v", err)
-	}
-	defer f.Close()
+	var lastErr error
 
-	file := &drive.File{
-		Name:    fileName,
-		Parents: []string{folderId},
+	for i := 0; i < maxRetries; i++ {
+		f, err := os.Open(filePath)
+		if err != nil {
+			return "", fmt.Errorf("не удалось открыть файл: %v", err)
+		}
+		defer f.Close()
+
+		file := &drive.File{
+			Name:    fileName,
+			Parents: []string{folderId},
+		}
+
+		res, err := service.Files.Create(file).Media(f).Fields("webViewLink").Do()
+		if err == nil {
+			return res.WebViewLink, nil
+		}
+
+		lastErr = err
+		log.Printf("Попытка %d загрузки файла не удалась: %v", i+1, err)
+
+		if strings.Contains(err.Error(), "oauth2: token expired") {
+			newClient, err := getClient(oauthConfig)
+			if err != nil {
+				log.Printf("Не удалось обновить клиент: %v", err)
+				continue
+			}
+
+			service, err = drive.NewService(context.Background(), option.WithHTTPClient(newClient))
+			if err != nil {
+				log.Printf("Не удалось создать новый Drive сервис: %v", err)
+				continue
+			}
+		}
+
+		time.Sleep(time.Duration(retryDelay*(i+1)) * time.Second)
 	}
 
-	res, err := service.Files.Create(file).Media(f).Fields("webViewLink").Do()
-	if err != nil {
-		return "", fmt.Errorf("не удалось загрузить файл на Google Drive: %v", err)
-	}
-
-	return res.WebViewLink, nil
+	return "", fmt.Errorf("не удалось загрузить файл после %d попыток: %v", maxRetries, lastErr)
 }
 
 func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedData) error {
@@ -487,7 +522,6 @@ func keepAlive(webhookURL string) {
 }
 
 func main() {
-	// Чтение переменных окружения
 	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if telegramToken == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN не установлен в переменных окружения")
@@ -518,7 +552,6 @@ func main() {
 		log.Fatal("GOOGLE_OAUTH_CLIENT_ID и GOOGLE_OAUTH_CLIENT_SECRET должны быть установлены в переменных окружения")
 	}
 
-	// Настройка OAuth2 конфигурации
 	oauthConfig = &oauth2.Config{
 		ClientID:     googleClientID,
 		ClientSecret: googleClientSecret,
@@ -535,19 +568,14 @@ func main() {
 		log.Fatalf("Не удалось получить OAuth2 клиента: %v", err)
 	}
 
-	// Создание Google Sheets сервиса
 	sheetsService, err := sheets.NewService(context.Background(), option.WithHTTPClient(client))
 	if err != nil {
 		log.Fatalf("Не удалось создать Sheets сервис: %v", err)
 	}
-
-	// Создание Google Drive сервиса
 	driveService, err := drive.NewService(context.Background(), option.WithHTTPClient(client))
 	if err != nil {
 		log.Fatalf("Не удалось создать Drive сервис: %v", err)
 	}
-
-	// Создание Telegram бота
 	bot, err := tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		log.Panic(err)
@@ -555,7 +583,6 @@ func main() {
 	bot.Debug = true
 	log.Printf("Авторизовался как %s", bot.Self.UserName)
 
-	// Настройка Webhook
 	webhookURL := os.Getenv("WEBHOOK_URL")
 	if webhookURL == "" {
 		log.Fatal("WEBHOOK_URL не установлен в переменных окружения")
@@ -566,7 +593,6 @@ func main() {
 		log.Fatalf("Неверный формат WEBHOOK_URL: %v", err)
 	}
 
-	// Устанавливаем webhook без возможности его удаления
 	webhookConfig := tgbotapi.WebhookConfig{
 		URL:            url,
 		MaxConnections: 40,
@@ -577,7 +603,6 @@ func main() {
 	}
 	log.Printf("Webhook установлен на %s", webhookURL)
 	keepAlive(webhookURL)
-	// Обработчик для входящих обновлений
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
 			bytes, _ := ioutil.ReadAll(r.Body)
@@ -634,13 +659,11 @@ func main() {
 		}
 	})
 
-	// Получение порта из переменных окружения
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	// Запуск HTTP-сервера
 	log.Printf("Запуск HTTP сервера на порту %s", port)
 	server := &http.Server{Addr: ":" + port}
 
@@ -650,22 +673,18 @@ func main() {
 		}
 	}()
 
-	// Создание канала для получения сигналов ОС
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
-	// Ожидание сигнала завершения
 	<-quit
 	log.Println("Получен сигнал завершения, останавливаем сервер...")
 
-	// Graceful shutdown только HTTP-сервера, без удаления webhook
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("Ошибка при остановке HTTP-сервера: %v", err)
 	}
 
-	// Ожидание завершения всех горутин
 	wg.Wait()
 
 	log.Println("Сервер успешно остановлен.")
