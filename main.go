@@ -293,16 +293,7 @@ func cleanAmount(amount string) string {
 	re := regexp.MustCompile(`[^0-9.,]`)
 	cleaned := re.ReplaceAllString(amount, "")
 	cleaned = strings.ReplaceAll(cleaned, ",", ".")
-
-	// Convert the string to a float for proper formatting (optional)
-	amountFloat, err := strconv.ParseFloat(cleaned, 64)
-	if err != nil {
-		log.Printf("Ошибка при преобразовании суммы: %v", err)
-		return cleaned // Return the cleaned string if conversion fails
-	}
-
-	// Format as currency with Russian rubles
-	return fmt.Sprintf("%,2f ₽", amountFloat)
+	return cleaned
 }
 
 func sanitizeFileName(name string) string {
@@ -505,10 +496,40 @@ func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedDat
 	rangeStr := fmt.Sprintf("'Чеки'!B%d:G%d", lastRow, lastRow)
 
 	_, err = service.Spreadsheets.Values.Update(spreadsheetId, rangeStr, vr).
-		ValueInputOption("RAW").
+		ValueInputOption("USER_ENTERED").
 		Do()
 	if err != nil {
 		return fmt.Errorf("не удалось обновить Google Sheets: %v", err)
+	}
+
+	formatRequest := sheets.BatchUpdateSpreadsheetRequest{
+		Requests: []*sheets.Request{
+			{
+				RepeatCell: &sheets.RepeatCellRequest{
+					Range: &sheets.GridRange{
+						SheetId:          1051413829,
+						StartRowIndex:    int64(lastRow - 1),
+						EndRowIndex:      int64(lastRow),
+						StartColumnIndex: 3,
+						EndColumnIndex:   4,
+					},
+					Cell: &sheets.CellData{
+						UserEnteredFormat: &sheets.CellFormat{
+							NumberFormat: &sheets.NumberFormat{
+								Type:    "NUMBER",
+								Pattern: "#,##0.00[$₽]",
+							},
+						},
+					},
+					Fields: "userEnteredFormat.numberFormat",
+				},
+			},
+		},
+	}
+
+	_, err = service.Spreadsheets.BatchUpdate(spreadsheetId, &formatRequest).Do()
+	if err != nil {
+		log.Printf("Предупреждение: не удалось установить форматирование: %v", err)
 	}
 
 	return nil
