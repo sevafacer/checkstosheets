@@ -316,6 +316,7 @@ func sendMessageToAdmin(bot *tgbotapi.BotAPI, adminID int64, message string) {
 	}
 }
 
+// Модифицированная функция handlePhotoMessage
 func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, driveFolderId string, adminID int64) {
 	if message.Photo == nil && message.Video == nil && message.Document == nil {
 		log.Println("Сообщение не содержит медиа")
@@ -344,7 +345,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 
 	moscowOffset := int((3 * time.Hour).Seconds())
 	moscowTime := time.Unix(int64(message.Date), 0).UTC().Add(time.Duration(moscowOffset) * time.Second)
-	dateFormatted := moscowTime.Format("02/01/2006 15:04:05")
+	dateFormatted := moscowTime.Format("02.01.2006") // Изменен формат даты на точки вместо слешей
 
 	username := getFullName(message.From)
 
@@ -371,12 +372,9 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	defer resp.Body.Close()
 
 	sanitizedAddress := sanitizeFileName(address)
-	dateStr := strings.ReplaceAll(dateFormatted, "/", "_")
-	dateStr = strings.ReplaceAll(dateStr, " ", "_")
-	dateStr = strings.ReplaceAll(dateStr, ":", "_")
-	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, dateStr)
+	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, dateFormatted)
 
-	tmpFile, err := ioutil.TempFile("", "receipt_*_"+fileName)
+	tmpFile, err := os.CreateTemp("", "receipt_*_"+fileName)
 	if err != nil {
 		log.Printf("Не удалось создать временный файл: %v", err)
 		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при сохранении фотографии. Попробуйте /start чтобы посмотреть справку.")
@@ -409,7 +407,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 		Amount:    amount,
 		Comment:   commentText,
 		Username:  username,
-		Date:      dateFormatted,
+		Date:      moscowTime.Format("02/01/2006 15:04:05"), // Сохраняем полный формат для таблицы
 		DriveLink: driveLink,
 	}
 
