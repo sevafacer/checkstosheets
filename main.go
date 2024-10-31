@@ -302,7 +302,7 @@ func cleanAmount(amount string) string {
 	}
 
 	// Format as currency with Russian rubles
-	return fmt.Sprintf("%.2f ₽", amountFloat)
+	return fmt.Sprintf("%,2f ₽", amountFloat)
 }
 
 func sanitizeFileName(name string) string {
