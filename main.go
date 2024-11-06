@@ -297,10 +297,19 @@ func cleanAmount(amount string) string {
 }
 
 func sanitizeFileName(name string) string {
-	re := regexp.MustCompile(`[^a-zA-Z0-9.-]`)
+	re := regexp.MustCompile(`[^а-яА-ЯёЁa-zA-Z0-9\s\.-]`)
 	sanitized := re.ReplaceAllString(name, "_")
+
+	multipleSpaces := regexp.MustCompile(`\s+`)
+	sanitized = multipleSpaces.ReplaceAllString(sanitized, " ")
+
+	sanitized = strings.ReplaceAll(sanitized, " ", "_")
+
 	multipleUnderscore := regexp.MustCompile(`_+`)
 	sanitized = multipleUnderscore.ReplaceAllString(sanitized, "_")
+
+	sanitized = strings.Trim(sanitized, "_")
+
 	return sanitized
 }
 
