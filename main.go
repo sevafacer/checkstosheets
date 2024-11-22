@@ -556,6 +556,119 @@ func keepAlive(webhookURL string) {
 	}()
 }
 
+func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
+	if len(message.Photo) == 0 && len(message.MediaGroupID) == 0 {
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Сообщение не содержит фотографии. Попробуйте снова.")
+		bot.Send(reply)
+		return
+	}
+
+	comment := message.Caption
+	address, amount, commentText, parseErr := parseMessage(comment)
+	if parseErr != nil {
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Не удалось распознать подпись к фото. Проверьте формат данных.")
+		bot.Send(reply)
+		return
+	}
+
+	// Проверим или создадим папку для объекта
+	objectFolderID, err := ensureObjectFolder(driveService, parentFolderId, address)
+	if err != nil {
+		log.Printf("Ошибка создания папки для объекта: %v", err)
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Ошибка обработки объекта. Попробуйте позже.")
+		bot.Send(reply)
+		return
+	}
+
+	// Сохраним ссылки на фото
+	var links []string
+	for _, photo := range message.Photo {
+		photoFile, err := bot.GetFile(tgbotapi.FileConfig{FileID: photo.FileID})
+		if err != nil {
+			log.Printf("Ошибка загрузки файла: %v", err)
+			continue
+		}
+		fileURL := photoFile.Link(bot.Token)
+		resp, err := http.Get(fileURL)
+		if err != nil {
+			log.Printf("Ошибка скачивания файла: %v", err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		fileName := sanitizeFileName(fmt.Sprintf("%s_%s.jpg", address, time.Now().Format("20060102_150405")))
+		tmpFile, err := os.CreateTemp("", fileName)
+		if err != nil {
+			log.Printf("Ошибка создания временного файла: %v", err)
+			continue
+		}
+		defer os.Remove(tmpFile.Name())
+
+		_, err = io.Copy(tmpFile, resp.Body)
+		if err != nil {
+			log.Printf("Ошибка копирования файла: %v", err)
+			continue
+		}
+
+		link, err := uploadFileToDrive(driveService, tmpFile.Name(), fileName, objectFolderID)
+		if err != nil {
+			log.Printf("Ошибка загрузки файла на Google Drive: %v", err)
+			continue
+		}
+		links = append(links, link)
+		if len(links) >= 10 {
+			break // Сохраним только первые 10 файлов
+		}
+	}
+
+	if len(links) == 0 {
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Не удалось загрузить фотографии. Попробуйте снова.")
+		bot.Send(reply)
+		return
+	}
+
+	parsedData := ParsedData{
+		Address:   address,
+		Amount:    amount,
+		Comment:   commentText,
+		Username:  getFullName(message.From),
+		Date:      time.Now().Format("02/01/2006 15:04:05"),
+		DriveLink: strings.Join(links, " | "),
+	}
+
+	if err := appendToSheet(sheetsService, spreadsheetId, parsedData); err != nil {
+		log.Printf("Ошибка записи в Google Sheets: %v", err)
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Ошибка записи данных. Попробуйте позже.")
+		bot.Send(reply)
+		return
+	}
+
+	reply := tgbotapi.NewMessage(message.Chat.ID, "Фотографии успешно добавлены.")
+	bot.Send(reply)
+}
+
+func ensureObjectFolder(service *drive.Service, parentFolderId, objectName string) (string, error) {
+	query := fmt.Sprintf("name = '%s' and mimeType = 'application/vnd.google-apps.folder' and '%s' in parents", objectName, parentFolderId)
+	fileList, err := service.Files.List().Q(query).Fields("files(id)").Do()
+	if err != nil {
+		return "", err
+	}
+	if len(fileList.Files) > 0 {
+		return fileList.Files[0].Id, nil
+	}
+
+	folder := &drive.File{
+		Name:     objectName,
+		Parents:  []string{parentFolderId},
+		MimeType: "application/vnd.google-apps.folder",
+	}
+	createdFolder, err := service.Files.Create(folder).Fields("id").Do()
+	if err != nil {
+		return "", err
+	}
+	return createdFolder.Id, nil
+}
+
 func main() {
 	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if telegramToken == "" {
@@ -683,7 +796,7 @@ func main() {
 				wg.Add(1)
 				go func(message *tgbotapi.Message) {
 					defer wg.Done()
-					handlePhotoMessage(bot, message, sheetsService, spreadsheetId, driveService, driveFolderId, adminID)
+					handleMediaGroupMessage(bot, message, sheetsService, spreadsheetId, driveService, driveFolderId, adminID)
 					<-semaphore
 				}(update.Message)
 			}
