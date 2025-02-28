@@ -292,7 +292,7 @@ func parseMessage(message string) (address string, amount string, comment string
 func cleanAmount(amount string) string {
 	re := regexp.MustCompile(`[^0-9.,]`)
 	cleaned := re.ReplaceAllString(amount, "")
-	cleaned = strings.ReplaceAll(cleaned, ",", ".")
+	cleaned = strings.ReplaceAll(cleaned, ".", ",")
 	return cleaned
 }
 
@@ -325,7 +325,6 @@ func sendMessageToAdmin(bot *tgbotapi.BotAPI, adminID int64, message string) {
 	}
 }
 
-// Модифицированная функция handlePhotoMessage
 func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, driveFolderId string, adminID int64) {
 	if message.Photo == nil && message.Video == nil && message.Document == nil {
 		log.Println("Сообщение не содержит медиа")
