@@ -253,58 +253,60 @@ func parseMessage(message string) (address string, amount string, comment string
 	}
 
 	lines := strings.Split(message, "\n")
-	var addr, amt, comm []string
+	dataMap := make(map[string]string)
+	scenario := 0
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-
-		found := false
-
+		parsed := false
 		for field, keywords := range fieldKeywords {
 			for _, keyword := range keywords {
-				patterns := []string{
-					fmt.Sprintf(`(?i)(%s\s*[:=-])\s*(.+)`, regexp.QuoteMeta(keyword)),
-					fmt.Sprintf(`(?i)^%s\s+(.+)`, regexp.QuoteMeta(keyword)),
-				}
-
-				for _, pattern := range patterns {
-					re := regexp.MustCompile(pattern)
-					matches := re.FindStringSubmatch(line)
-					if len(matches) > 0 {
-						value := strings.TrimSpace(matches[len(matches)-1])
-						if value != "" {
-							switch field {
-							case "address":
-								addr = append(addr, value)
-							case "amount":
-								value = cleanAmount(value)
-								amt = append(amt, value)
-							case "comment":
-								comm = append(comm, value)
-							}
-							found = true
-							break
-						}
-					}
-				}
-				if found {
+				re := regexp.MustCompile(fmt.Sprintf(`(?i)(%s\s*[:=-])\s*(.+)`, regexp.QuoteMeta(keyword)))
+				matches := re.FindStringSubmatch(line)
+				if len(matches) > 0 {
+					dataMap[field] = strings.TrimSpace(matches[len(matches)-1])
+					parsed = true
+					scenario = 1
 					break
 				}
 			}
-			if found {
+			if parsed {
 				break
 			}
 		}
+		if !parsed && scenario == 0 && len(dataMap) == 0 && scenario != 1 {
+			scenario = 2
+		}
 	}
 
-	if len(addr) == 0 || len(amt) == 0 {
+	if scenario == 1 {
+		// Сценарий с ключевыми словами
+		address = dataMap["address"]
+		amount = dataMap["amount"]
+		comment = dataMap["comment"]
+	} else if scenario == 2 {
+		// Сценарий без ключевых слов
+		if len(lines) > 0 {
+			address = strings.TrimSpace(lines[0])
+		}
+		if len(lines) > 1 {
+			amount = cleanAmount(strings.TrimSpace(lines[1]))
+		}
+		if len(lines) > 2 {
+			comment = strings.TrimSpace(strings.Join(lines[2:], "\n"))
+		}
+	} else {
+		return "", "", "", errors.New("не удалось распознать формат сообщения")
+	}
+
+	if address == "" || amount == "" {
 		return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
 	}
 
-	return strings.Join(addr, " "), strings.Join(amt, " "), strings.Join(comm, " "), nil
+	return address, amount, comment, nil
 }
 
 func cleanAmount(amount string) string {
@@ -542,7 +544,6 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 		return
 	}
 
-	// Загружаем одиночное фото
 	sanitizedAddress := sanitizeFileName(address)
 	photoFile, err := bot.GetFile(tgbotapi.FileConfig{FileID: bestPhoto.FileID})
 	if err != nil {
@@ -561,7 +562,6 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 		return
 	}
 
-	// Добавляем данные в Google Sheets
 	parsedData := ParsedData{
 		Address:   address,
 		Amount:    amount,
@@ -676,7 +676,7 @@ func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService 
 		Comment:   commentText,
 		Username:  username,
 		Date:      time.Now().Format("02/01/2006 15:04:05"),
-		DriveLink: strings.Join(links, " "),
+		DriveLink: strings.Join(links, "\n"),
 	}
 
 	if err := appendToSheet(sheetsService, spreadsheetId, parsedData); err != nil {
