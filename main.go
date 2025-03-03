@@ -252,43 +252,35 @@ func parseMessage(message string) (address string, amount string, comment string
 		return "", "", "", errors.New("пустое сообщение")
 	}
 
-	lines := strings.Split(message, "\n")
 	dataMap := make(map[string]string)
-	scenario := 0
+	scenario := 0 // 0 - не определен, 1 - ключевые слова, 2 - без ключевых слов
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parsed := false
-		for field, keywords := range fieldKeywords {
-			for _, keyword := range keywords {
-				re := regexp.MustCompile(fmt.Sprintf(`(?i)(%s\s*[:=-])\s*(.+)`, regexp.QuoteMeta(keyword)))
-				matches := re.FindStringSubmatch(line)
-				if len(matches) > 0 {
-					dataMap[field] = strings.TrimSpace(matches[len(matches)-1])
-					parsed = true
-					scenario = 1
-					break
-				}
+	lines := strings.Split(message, "\n")
+
+	// === Попытка парсинга с ключевыми словами (обновлено для обработки одной строки) ===
+	parsedWithKeywords := false
+	messageLine := strings.ReplaceAll(message, "\n", " ") // Объединяем все строки в одну для обработки ключевых слов
+	for field, keywords := range fieldKeywords {
+		for _, keyword := range keywords {
+			re := regexp.MustCompile(fmt.Sprintf(`(?i)(%s\s*[:=])\s*([^\s].*?)(?:\s+(?:\w+[:=]|$)|$)`, regexp.QuoteMeta(keyword))) // Regex для поиска значений после ключевого слова
+			matches := re.FindStringSubmatch(messageLine)
+			if len(matches) > 0 {
+				value := strings.TrimSpace(matches[2]) // Значение теперь в matches[2]
+				dataMap[field] = value
+				parsedWithKeywords = true
+				scenario = 1 // Определен сценарий с ключевыми словами
 			}
-			if parsed {
-				break
-			}
-		}
-		if !parsed && scenario == 0 && len(dataMap) == 0 && scenario != 1 {
-			scenario = 2
 		}
 	}
 
-	if scenario == 1 {
+	if parsedWithKeywords {
 		// Сценарий с ключевыми словами
 		address = dataMap["address"]
 		amount = dataMap["amount"]
 		comment = dataMap["comment"]
-	} else if scenario == 2 {
-		// Сценарий без ключевых слов
+
+	} else { // Если не удалось разобрать как ключевые слова, пробуем сценарий без ключевых слов
+		scenario = 2 // Сценарий без ключевых слов по умолчанию, если не распознаны ключевые слова
 		if len(lines) > 0 {
 			address = strings.TrimSpace(lines[0])
 		}
@@ -298,12 +290,12 @@ func parseMessage(message string) (address string, amount string, comment string
 		if len(lines) > 2 {
 			comment = strings.TrimSpace(strings.Join(lines[2:], "\n"))
 		}
-	} else {
-		return "", "", "", errors.New("не удалось распознать формат сообщения")
 	}
 
-	if address == "" || amount == "" {
+	if address == "" || amount == "" && scenario != 0 { // Проверка обязательных полей для обоих сценариев, кроме случая, когда сценарий не определен
 		return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
+	} else if scenario == 0 {
+		return "", "", "", errors.New("не удалось распознать формат сообщения") // Добавлена ошибка для неопределенного сценария
 	}
 
 	return address, amount, comment, nil
