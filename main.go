@@ -254,80 +254,133 @@ type fieldMatch struct {
 	end   int
 }
 
-// Основная функция парсинга сообщения.
+func removeLeadingKeyword(text string, keywords []string) string {
+	trimmed := strings.TrimSpace(text)
+	lower := strings.ToLower(trimmed)
+	for _, kw := range keywords {
+		if strings.HasPrefix(lower, kw) {
+			// Удаляем ключевое слово и последующие пробелы.
+			without := strings.TrimSpace(trimmed[len(kw):])
+			return without
+		}
+	}
+	return trimmed
+}
+
+func fallbackParse(message string) (address string, amount string, comment string, err error) {
+	// Если сообщение многострочное, обрабатываем каждую строку отдельно.
+	if strings.Contains(message, "\n") {
+		lines := strings.Split(message, "\n")
+		if len(lines) > 0 {
+			address = removeLeadingKeyword(strings.TrimSpace(lines[0]), fieldKeywords["address"])
+		}
+		if len(lines) > 1 {
+			amount = removeLeadingKeyword(strings.TrimSpace(lines[1]), fieldKeywords["amount"])
+			amount = cleanAmount(amount)
+		}
+		if len(lines) > 2 {
+			comment = removeLeadingKeyword(strings.TrimSpace(strings.Join(lines[2:], "\n")), fieldKeywords["comment"])
+		}
+	} else {
+		// Однострочное сообщение.
+		// Пытаемся найти ключевое слово суммы.
+		lowerMsg := strings.ToLower(message)
+		amountIdx := -1
+		for _, kw := range fieldKeywords["amount"] {
+			idx := strings.Index(lowerMsg, kw)
+			if idx != -1 && (amountIdx == -1 || idx < amountIdx) {
+				amountIdx = idx
+			}
+		}
+		if amountIdx != -1 {
+			// Всё до найденного ключевого слова суммы – это адрес.
+			addressPart := strings.TrimSpace(message[:amountIdx])
+			amountPart := strings.TrimSpace(message[amountIdx:])
+			address = removeLeadingKeyword(addressPart, fieldKeywords["address"])
+			amountPart = removeLeadingKeyword(amountPart, fieldKeywords["amount"])
+			// Если во второй части есть и комментарий, отделяем его.
+			commentIdx := -1
+			lowerAmountPart := strings.ToLower(amountPart)
+			for _, kw := range fieldKeywords["comment"] {
+				idx := strings.Index(lowerAmountPart, kw)
+				if idx != -1 && (commentIdx == -1 || idx < commentIdx) {
+					commentIdx = idx
+				}
+			}
+			if commentIdx != -1 {
+				amt := strings.TrimSpace(amountPart[:commentIdx])
+				comment = removeLeadingKeyword(strings.TrimSpace(amountPart[commentIdx:]), fieldKeywords["comment"])
+				amount = cleanAmount(amt)
+			} else {
+				amount = cleanAmount(amountPart)
+			}
+		} else {
+			// Если нет ключевого слова суммы – считаем всё как адрес.
+			address = removeLeadingKeyword(message, fieldKeywords["address"])
+		}
+	}
+
+	if address == "" || amount == "" {
+		return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
+	}
+	return address, amount, comment, nil
+}
+
+// Основная функция парсинга.
 func parseMessage(message string) (address string, amount string, comment string, err error) {
 	if strings.TrimSpace(message) == "" {
 		return "", "", "", errors.New("пустое сообщение")
 	}
 
-	// Нормализуем сообщение: убираем лишние пробелы и объединяем в одну строку.
-	normalized := strings.Join(strings.Fields(message), " ")
-
-	var matches []fieldMatch
-
-	// Поиск вхождений ключевых слов для каждого поля.
-	for field, keywords := range fieldKeywords {
-		for _, kw := range keywords {
-			// Шаблон: ключевое слово + разделитель (":" или "=") с возможными пробелами.
-			pattern := fmt.Sprintf("(?i)%s\\s*[:=]\\s*", regexp.QuoteMeta(kw))
-			re := regexp.MustCompile(pattern)
-			locs := re.FindAllStringIndex(normalized, -1)
-			for _, loc := range locs {
-				matches = append(matches, fieldMatch{
-					field: field,
-					start: loc[0],
-					end:   loc[1],
-				})
+	// Если сообщение содержит символы ":" или "=" – пробуем regex-подход.
+	if strings.Contains(message, ":") || strings.Contains(message, "=") {
+		normalized := strings.Join(strings.Fields(message), " ")
+		var matches []fieldMatch
+		for field, keywords := range fieldKeywords {
+			for _, kw := range keywords {
+				// Шаблон: ключевое слово + разделитель с пробелами.
+				pattern := fmt.Sprintf("(?i)%s\\s*[:=]\\s*", regexp.QuoteMeta(kw))
+				re := regexp.MustCompile(pattern)
+				locs := re.FindAllStringIndex(normalized, -1)
+				for _, loc := range locs {
+					matches = append(matches, fieldMatch{
+						field: field,
+						start: loc[0],
+						end:   loc[1],
+					})
+				}
 			}
 		}
-	}
 
-	// Если ключевые слова не найдены, используем fallback-режим: разделение по строкам.
-	if len(matches) == 0 {
-		lines := strings.Split(message, "\n")
-		if len(lines) > 0 {
-			address = strings.TrimSpace(lines[0])
+		if len(matches) > 0 {
+			sort.Slice(matches, func(i, j int) bool {
+				return matches[i].start < matches[j].start
+			})
+			fieldValues := make(map[string]string)
+			for i, m := range matches {
+				endPos := len(normalized)
+				if i < len(matches)-1 {
+					endPos = matches[i+1].start
+				}
+				value := strings.TrimSpace(normalized[m.end:endPos])
+				if _, exists := fieldValues[m.field]; !exists && value != "" {
+					fieldValues[m.field] = value
+				}
+			}
+			address = fieldValues["address"]
+			amount = cleanAmount(fieldValues["amount"])
+			comment = fieldValues["comment"]
 		}
-		if len(lines) > 1 {
-			amount = cleanAmount(strings.TrimSpace(lines[1]))
-		}
-		if len(lines) > 2 {
-			comment = strings.TrimSpace(strings.Join(lines[2:], "\n"))
-		}
+
+		// Если обязательные поля не получены – переходим в fallback.
 		if address == "" || amount == "" {
-			return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
+			return fallbackParse(message)
 		}
 		return address, amount, comment, nil
 	}
 
-	// Сортируем найденные вхождения по позиции в строке.
-	sort.Slice(matches, func(i, j int) bool {
-		return matches[i].start < matches[j].start
-	})
-
-	// Извлекаем значения: для каждого найденного ключевого слова берём текст от конца совпадения до начала следующего (или до конца строки)
-	fieldValues := make(map[string]string)
-	for i, m := range matches {
-		endPos := len(normalized)
-		if i < len(matches)-1 {
-			endPos = matches[i+1].start
-		}
-		value := strings.TrimSpace(normalized[m.end:endPos])
-		if _, exists := fieldValues[m.field]; !exists && value != "" {
-			fieldValues[m.field] = value
-		}
-	}
-
-	address = fieldValues["address"]
-	amount = cleanAmount(fieldValues["amount"])
-	comment = fieldValues["comment"]
-
-	// Проверка обязательных полей.
-	if address == "" || amount == "" {
-		return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
-	}
-
-	return address, amount, comment, nil
+	// Если разделителей нет – сразу используем fallback.
+	return fallbackParse(message)
 }
 
 func cleanAmount(amount string) string {
