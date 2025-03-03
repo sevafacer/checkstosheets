@@ -572,7 +572,6 @@ func worker(taskQueue <-chan FileTask, resultsChan chan<- FileResult, driveServi
 }
 
 // --- Обработчики сообщений Telegram ---
-// ... (handleMediaGroupMessage - с усиленным логированием) ...
 func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
 	if len(message.Photo) == 0 {
 		reply := tgbotapi.NewMessage(message.Chat.ID, "Сообщение не содержит фотографии. Попробуйте снова.")
