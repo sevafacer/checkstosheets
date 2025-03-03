@@ -581,44 +581,40 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 
 	// Сохраним ссылки на фото
 	var links []string
-	for _, photo := range message.Photo {
-		photoFile, err := bot.GetFile(tgbotapi.FileConfig{FileID: photo.FileID})
-		if err != nil {
-			log.Printf("Ошибка загрузки файла: %v", err)
-			continue
-		}
-		fileURL := photoFile.Link(bot.Token)
-		resp, err := http.Get(fileURL)
-		if err != nil {
-			log.Printf("Ошибка скачивания файла: %v", err)
-			continue
-		}
-		defer resp.Body.Close()
-
-		fileName := sanitizeFileName(fmt.Sprintf("%s_%s.jpg", address, time.Now().Format("20060102_150405")))
-		tmpFile, err := os.CreateTemp("", fileName)
-		if err != nil {
-			log.Printf("Ошибка создания временного файла: %v", err)
-			continue
-		}
-		defer os.Remove(tmpFile.Name())
-
-		_, err = io.Copy(tmpFile, resp.Body)
-		if err != nil {
-			log.Printf("Ошибка копирования файла: %v", err)
-			continue
-		}
-
-		link, err := uploadFileToDrive(driveService, tmpFile.Name(), fileName, objectFolderID)
-		if err != nil {
-			log.Printf("Ошибка загрузки файла на Google Drive: %v", err)
-			continue
-		}
-		links = append(links, link)
-		if len(links) >= 10 {
-			break // Сохраним только первые 10 файлов
-		}
+	bestPhoto := message.Photo[len(message.Photo)-1]
+	photoFile, err := bot.GetFile(tgbotapi.FileConfig{FileID: bestPhoto.FileID})
+	if err != nil {
+		log.Printf("Ошибка загрузки файла: %v", err)
+		return
 	}
+	fileURL := photoFile.Link(bot.Token)
+
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		log.Printf("Ошибка скачивания файла: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	fileName := sanitizeFileName(fmt.Sprintf("%s_%s.jpg", address, time.Now().Format("20060102_150405")))
+	tmpFile, err := os.CreateTemp("", fileName)
+	if err != nil {
+		log.Printf("Ошибка создания временного файла: %v", err)
+		return
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err = io.Copy(tmpFile, resp.Body); err != nil {
+		log.Printf("Ошибка копирования файла: %v", err)
+		return
+	}
+
+	link, err := uploadFileToDrive(driveService, tmpFile.Name(), fileName, objectFolderID)
+	if err != nil {
+		log.Printf("Ошибка загрузки файла на Google Drive: %v", err)
+		return
+	}
+	links = append(links, link)
 
 	if len(links) == 0 {
 		reply := tgbotapi.NewMessage(message.Chat.ID, "Не удалось загрузить фотографии. Попробуйте снова.")
@@ -632,7 +628,7 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 		Comment:   commentText,
 		Username:  getFullName(message.From),
 		Date:      time.Now().Format("02/01/2006 15:04:05"),
-		DriveLink: strings.Join(links, " | "),
+		DriveLink: strings.Join(links, " "),
 	}
 
 	if err := appendToSheet(sheetsService, spreadsheetId, parsedData); err != nil {
