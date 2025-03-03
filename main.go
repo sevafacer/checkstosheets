@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -247,33 +248,42 @@ func getFullName(user *tgbotapi.User) string {
 	return user.FirstName
 }
 
+type fieldMatch struct {
+	field string
+	start int
+	end   int
+}
+
+// Основная функция парсинга сообщения.
 func parseMessage(message string) (address string, amount string, comment string, err error) {
-	// Проверка на пустое сообщение
 	if strings.TrimSpace(message) == "" {
 		return "", "", "", errors.New("пустое сообщение")
 	}
 
+	// Нормализуем сообщение: убираем лишние пробелы и объединяем в одну строку.
 	normalized := strings.Join(strings.Fields(message), " ")
 
-	addressPattern := strings.Join(fieldKeywords["address"], "|")
-	amountPattern := strings.Join(fieldKeywords["amount"], "|")
-	commentPattern := strings.Join(fieldKeywords["comment"], "|")
+	var matches []fieldMatch
 
-	addressRegex := regexp.MustCompile(`(?i)(?:` + addressPattern + `)\s*[:=]\s*(.+?)(?=\s+(?:` + amountPattern + `|` + commentPattern + `)\s*[:=]|$)`)
-	amountRegex := regexp.MustCompile(`(?i)(?:` + amountPattern + `)\s*[:=]\s*(.+?)(?=\s+(?:` + commentPattern + `)\s*[:=]|$)`)
-	commentRegex := regexp.MustCompile(`(?i)(?:` + commentPattern + `)\s*[:=]\s*(.+)$`)
+	// Поиск вхождений ключевых слов для каждого поля.
+	for field, keywords := range fieldKeywords {
+		for _, kw := range keywords {
+			// Шаблон: ключевое слово + разделитель (":" или "=") с возможными пробелами.
+			pattern := fmt.Sprintf("(?i)%s\\s*[:=]\\s*", regexp.QuoteMeta(kw))
+			re := regexp.MustCompile(pattern)
+			locs := re.FindAllStringIndex(normalized, -1)
+			for _, loc := range locs {
+				matches = append(matches, fieldMatch{
+					field: field,
+					start: loc[0],
+					end:   loc[1],
+				})
+			}
+		}
+	}
 
-	if m := addressRegex.FindStringSubmatch(normalized); len(m) > 1 {
-		address = strings.TrimSpace(m[1])
-	}
-	if m := amountRegex.FindStringSubmatch(normalized); len(m) > 1 {
-		amount = cleanAmount(strings.TrimSpace(m[1]))
-	}
-	if m := commentRegex.FindStringSubmatch(normalized); len(m) > 1 {
-		comment = strings.TrimSpace(m[1])
-	}
-
-	if address == "" || amount == "" {
+	// Если ключевые слова не найдены, используем fallback-режим: разделение по строкам.
+	if len(matches) == 0 {
 		lines := strings.Split(message, "\n")
 		if len(lines) > 0 {
 			address = strings.TrimSpace(lines[0])
@@ -284,8 +294,35 @@ func parseMessage(message string) (address string, amount string, comment string
 		if len(lines) > 2 {
 			comment = strings.TrimSpace(strings.Join(lines[2:], "\n"))
 		}
+		if address == "" || amount == "" {
+			return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
+		}
+		return address, amount, comment, nil
 	}
 
+	// Сортируем найденные вхождения по позиции в строке.
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].start < matches[j].start
+	})
+
+	// Извлекаем значения: для каждого найденного ключевого слова берём текст от конца совпадения до начала следующего (или до конца строки)
+	fieldValues := make(map[string]string)
+	for i, m := range matches {
+		endPos := len(normalized)
+		if i < len(matches)-1 {
+			endPos = matches[i+1].start
+		}
+		value := strings.TrimSpace(normalized[m.end:endPos])
+		if _, exists := fieldValues[m.field]; !exists && value != "" {
+			fieldValues[m.field] = value
+		}
+	}
+
+	address = fieldValues["address"]
+	amount = cleanAmount(fieldValues["amount"])
+	comment = fieldValues["comment"]
+
+	// Проверка обязательных полей.
 	if address == "" || amount == "" {
 		return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
 	}
