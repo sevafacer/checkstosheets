@@ -34,8 +34,8 @@ const (
 	maxRetries         = 3
 	retryDelay         = 2
 	tokenRefreshWindow = 5 * time.Minute
-	maxGoroutines      = 100 // *** Увеличено для worker pool ***
-	numWorkers         = 50  // *** Количество worker-ов в пуле ***
+	maxGoroutines      = 100 // Увеличено для worker pool
+	numWorkers         = 50  // Количество worker-ов в пуле
 	sheetIDRange       = "'Чеки'!B:B"
 	sheetUpdateRange   = "'Чеки'!B%d:G%d"
 	sheetFormatRange   = "'Чеки'!B%d:G%d"
@@ -60,8 +60,8 @@ var (
 	mediaGroupCacheMu  sync.Mutex
 	mediaGroupExpiryCh = make(chan string, 100)
 
-	taskQueue   = make(chan FileTask, 100)   // *** Канал для задач worker pool ***
-	resultsChan = make(chan FileResult, 100) // *** Канал для результатов worker pool ***
+	taskQueue   = make(chan FileTask, 100)
+	resultsChan = make(chan FileResult, 100)
 )
 
 type ParsedData struct {
@@ -437,14 +437,14 @@ func refreshDriveService(service *drive.Service, originalErr error) (*drive.Serv
 }
 
 // --- Функции для работы с Google Sheets ---
-// ... (appendToSheet - без изменений) ...
+
 func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedData) error {
 	values := []interface{}{
 		data.Date,
 		data.Username, data.Address,
 		data.Amount,
 		data.Comment,
-		data.DriveLink,
+		formatDriveLinksForSheet(data.DriveLink), // Используем функцию форматирования ссылок
 	}
 
 	vr := &sheets.ValueRange{
@@ -503,6 +503,26 @@ func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedDat
 	return nil
 }
 
+// formatDriveLinksForSheet формирует Rich Text для Google Sheets для отображения нескольких ссылок.
+func formatDriveLinksForSheet(driveLinks string) string {
+	links := strings.Split(strings.TrimSpace(driveLinks), " ") // Разделяем ссылки по пробелу
+	if len(links) == 1 {
+		return driveLinks // Если ссылка одна, возвращаем как есть
+	}
+
+	var formulaParts []string
+	for _, link := range links {
+		if link != "" {
+			formulaParts = append(formulaParts, fmt.Sprintf(`HYPERLINK("%s", "%s")`, link, "Чек")) // "Чек" как текст ссылки
+		}
+	}
+
+	if len(formulaParts) > 0 {
+		return "=TEXTJOIN(\", \", TRUE, " + strings.Join(formulaParts, ", ") + ")" // TEXTJOIN для объединения гиперссылок
+	}
+	return driveLinks // Если нет ссылок, возвращаем исходную строку (или пустую)
+}
+
 // --- Функции Telegram Bot ---
 // ... (keepAlive, startMediaGroupCacheCleaner - без изменений) ...
 func keepAlive(webhookURL string) {
@@ -531,7 +551,7 @@ func startMediaGroupCacheCleaner() {
 }
 
 // --- Worker Pool ---
-
+// ... (startWorkers, worker - без изменений) ...
 func startWorkers(numWorkers int, driveService *drive.Service, objectFolderID string) {
 	for i := 0; i < numWorkers; i++ {
 		go worker(taskQueue, resultsChan, driveService, objectFolderID)
@@ -540,13 +560,19 @@ func startWorkers(numWorkers int, driveService *drive.Service, objectFolderID st
 
 func worker(taskQueue <-chan FileTask, resultsChan chan<- FileResult, driveService *drive.Service, objectFolderID string) {
 	for task := range taskQueue {
+		log.Printf("Worker начал обработку FileID: %s", task.FileID) // Лог начала обработки worker-ом
 		link, err := downloadAndUploadFile(task.FileURL, task.BaseName, task.DateFormatted, task.Amount, driveService, objectFolderID)
+		if err != nil {
+			log.Printf("Worker завершил обработку FileID: %s с ошибкой: %v", task.FileID, err) // Лог завершения c ошибкой worker-ом
+		} else {
+			log.Printf("Worker успешно завершил обработку FileID: %s, DriveLink: %s", task.FileID, link) // Лог успешного завершения worker-ом
+		}
 		resultsChan <- FileResult{FileID: task.FileID, DriveLink: link, Error: err}
 	}
 }
 
 // --- Обработчики сообщений Telegram ---
-
+// ... (handleMediaGroupMessage - с усиленным логированием) ...
 func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
 	if len(message.Photo) == 0 {
 		reply := tgbotapi.NewMessage(message.Chat.ID, "Сообщение не содержит фотографии. Попробуйте снова.")
@@ -758,10 +784,12 @@ func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService 
 	dateFormatted := moscowTime.Format("02.01.2006")
 	sanitizedAddress := sanitizeFileName(address)
 
+	log.Printf("processMediaGroup: Начинаем подготовку задач для медиагруппы %s, количество файлов: %d", mediaGroupID, len(unprocessedFileIDs)) // Лог начала подготовки задач
+
 	for i, fileID := range unprocessedFileIDs {
 		photoFile, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
 		if err != nil {
-			log.Printf("Ошибка загрузки файла из медиагруппы (ID: %s): %v", fileID, err)
+			log.Printf("processMediaGroup: Ошибка загрузки файла из медиагруппы (ID: %s): %v", fileID, err)
 			continue // Пропускаем файл с ошибкой, но продолжаем обработку остальных
 		}
 		fileURL := photoFile.Link(bot.Token)
@@ -778,15 +806,19 @@ func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService 
 		})
 	}
 
+	log.Printf("processMediaGroup: Подготовлено %d задач для медиагруппы %s, запускаем worker pool", len(tasks), mediaGroupID) // Лог запуска worker pool
+
 	// Запускаем воркеры для обработки файлов
 	startWorkers(numWorkers, driveService, objectFolderID)
 
 	// Отправляем задачи в очередь
 	go func() {
+		log.Printf("processMediaGroup: Отправляем %d задач в taskQueue для медиагруппы %s", len(tasks), mediaGroupID) // Лог отправки задач в очередь
 		for _, task := range tasks {
 			taskQueue <- task
 		}
-		close(taskQueue) // Закрываем taskQueue после отправки всех задач
+		close(taskQueue)                                                                   // Закрываем taskQueue после отправки всех задач
+		log.Printf("processMediaGroup: taskQueue закрыт для медиагруппы %s", mediaGroupID) // Лог закрытия taskQueue
 	}()
 
 	// Собираем результаты обработки файлов
@@ -794,17 +826,21 @@ func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService 
 	successCount := 0
 	processedFiles := make(map[string]bool) // Для отслеживания обработанных FileID
 
-	for range tasks { // Ожидаем результатов для каждого файла в tasks
+	log.Printf("processMediaGroup: Ожидаем результаты из resultsChan для %d задач медиагруппы %s", len(tasks), mediaGroupID) // Лог начала ожидания результатов
+
+	for i := 0; i < len(tasks); i++ { // *** Исправлено: цикл for i := 0; i < len(tasks); i++ ***
 		result := <-resultsChan
+		log.Printf("processMediaGroup: Получен результат из resultsChan для FileID: %s, DriveLink: %s, Error: %v", result.FileID, result.DriveLink, result.Error) // Лог получения результата
 		if result.Error != nil {
-			log.Printf("Ошибка обработки файла из worker pool, FileID: %s, ошибка: %v", result.FileID, result.Error)
+			log.Printf("processMediaGroup: Ошибка обработки файла из worker pool, FileID: %s, ошибка: %v", result.FileID, result.Error)
 		} else {
 			links = append(links, result.DriveLink)
 			successCount++
 			processedFiles[result.FileID] = true // Помечаем FileID как обработанный
 		}
 	}
-	close(resultsChan) // Закрываем resultsChan после сбора всех результатов
+	close(resultsChan)                                                                                                                                           // Закрываем resultsChan после сбора всех результатов
+	log.Printf("processMediaGroup: resultsChan закрыт для медиагруппы %s, всего получено результатов: %d, успешных: %d", mediaGroupID, len(tasks), successCount) // Лог закрытия resultsChan и статистики
 
 	// Обновляем кэш медиагруппы, помечая успешно обработанные файлы
 	mediaGroupCacheMu.Lock()
@@ -833,18 +869,21 @@ func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService 
 	// *** Асинхронная запись в Google Sheets ***
 	go func() {
 		if err := appendToSheet(sheetsService, spreadsheetId, parsedData); err != nil {
-			log.Printf("Ошибка асинхронной записи в Google Sheets: %v", err) // Логируем ошибку асинхронной записи
-			notifyAdminAboutSheetError(bot, adminID, err, mediaGroupID)      // Оповещаем админа об ошибке
+			log.Printf("processMediaGroup: Ошибка асинхронной записи в Google Sheets: %v", err) // Логируем ошибку асинхронной записи
+			notifyAdminAboutSheetError(bot, adminID, err, mediaGroupID)                         // Оповещаем админа об ошибке
 		} else {
-			log.Printf("Успешная асинхронная запись в Google Sheets для медиагруппы: %s", mediaGroupID) // Логируем успешную запись
+			log.Printf("processMediaGroup: Успешная асинхронная запись в Google Sheets для медиагруппы: %s", mediaGroupID) // Логируем успешную запись
 		}
 	}()
 
 	successMessage := fmt.Sprintf("Успешно обработано %d фото из медиагруппы.", successCount)
 	reply := tgbotapi.NewMessage(chatID, successMessage)
 	bot.Send(reply)
+
+	log.Printf("processMediaGroup: Завершена обработка медиагруппы %s, всего файлов: %d, успешно загружено: %d", mediaGroupID, len(tasks), successCount) // Лог завершения обработки медиагруппы
 }
 
+// ... (notifyAdminAboutSheetError, downloadAndUploadFile - без изменений) ...
 func notifyAdminAboutSheetError(bot *tgbotapi.BotAPI, adminID int64, err error, mediaGroupID string) {
 	errorMessage := fmt.Sprintf("Ошибка записи в Google Sheets для медиагруппы %s: %v", mediaGroupID, err)
 	adminMessage := tgbotapi.NewMessage(adminID, errorMessage)
@@ -855,33 +894,33 @@ func notifyAdminAboutSheetError(bot *tgbotapi.BotAPI, adminID int64, err error, 
 }
 
 func downloadAndUploadFile(fileURL, baseName, dateFormatted, amount string, driveService *drive.Service, objectFolderID string) (string, error) {
-	log.Printf("Начало скачивания файла из URL: %s", fileURL) // Лог начала скачивания
+	log.Printf("downloadAndUploadFile: Начало скачивания файла из URL: %s", fileURL) // Лог начала скачивания
 	resp, err := http.Get(fileURL)
 	if err != nil {
-		return "", fmt.Errorf("ошибка скачивания файла: %v", err)
+		return "", fmt.Errorf("downloadAndUploadFile: Ошибка скачивания файла: %v", err)
 	}
 	defer resp.Body.Close()
 
 	fileName := sanitizeFileName(fmt.Sprintf("%s_%s_%s.jpg", baseName, dateFormatted, amount))
 	tmpFile, err := os.CreateTemp("", fileName)
 	if err != nil {
-		return "", fmt.Errorf("ошибка создания временного файла: %v", err)
+		return "", fmt.Errorf("downloadAndUploadFile: Ошибка создания временного файла: %v", err)
 	}
 	defer os.Remove(tmpFile.Name())
 
-	log.Printf("Начало копирования скачанного файла во временный файл: %s", tmpFile.Name()) // Лог начала копирования
+	log.Printf("downloadAndUploadFile: Начало копирования скачанного файла во временный файл: %s", tmpFile.Name()) // Лог начала копирования
 	if _, err = io.Copy(tmpFile, resp.Body); err != nil {
-		return "", fmt.Errorf("ошибка копирования файла: %v", err)
+		return "", fmt.Errorf("downloadAndUploadFile: Ошибка копирования файла: %v", err)
 	}
 	tmpFile.Close()
-	log.Printf("Копирование файла во временный файл завершено: %s", tmpFile.Name()) // Лог завершения копирования
+	log.Printf("downloadAndUploadFile: Копирование файла во временный файл завершено: %s", tmpFile.Name()) // Лог завершения копирования
 
-	log.Printf("Начало загрузки файла на Google Drive: %s, имя файла: %s, папка ID: %s", tmpFile.Name(), fileName, objectFolderID) // Лог начала загрузки
+	log.Printf("downloadAndUploadFile: Начало загрузки файла на Google Drive: %s, имя файла: %s, папка ID: %s", tmpFile.Name(), fileName, objectFolderID) // Лог начала загрузки
 	link, err := uploadFileToDrive(driveService, tmpFile.Name(), fileName, objectFolderID)
 	if err != nil {
-		return "", fmt.Errorf("ошибка загрузки файла на Google Drive: %v", err)
+		return "", fmt.Errorf("downloadAndUploadFile: Ошибка загрузки файла на Google Drive: %v", err)
 	}
-	log.Printf("Загрузка файла на Google Drive завершена, ссылка: %s", link) // Лог завершения загрузки
+	log.Printf("downloadAndUploadFile: Загрузка файла на Google Drive завершена, ссылка: %s", link) // Лог завершения загрузки
 
 	return link, nil
 }
@@ -1050,7 +1089,7 @@ func sanitizeFileName(name string) string {
 }
 
 // --- Основная функция main ---
-// ... (main - с изменениями для worker pool и увеличенным maxGoroutines) ...
+// ... (main - без изменений) ...
 func main() {
 	// --- 1. Загрузка переменных окружения ---
 	telegramToken, spreadsheetId, driveFolderId, adminID, googleClientID, googleClientSecret, webhookURL := loadEnvVars()
