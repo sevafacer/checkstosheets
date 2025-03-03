@@ -67,6 +67,24 @@ const (
 	tokenRefreshWindow = 5 * time.Minute
 )
 
+type MediaGroupData struct {
+	Files       map[string]bool
+	Caption     string
+	Address     string
+	Amount      string
+	Comment     string
+	LastUpdated time.Time
+	UserID      int64
+	ChatID      int64
+	Username    string
+}
+
+var (
+	mediaGroupCache    = make(map[string]*MediaGroupData)
+	mediaGroupCacheMu  sync.Mutex
+	mediaGroupExpiryCh = make(chan string, 100)
+)
+
 func saveTokenToEnv(token *oauth2.Token) error {
 	if token == nil {
 		return fmt.Errorf("попытка сохранить пустой токен")
@@ -313,126 +331,6 @@ func sanitizeFileName(name string) string {
 	return sanitized
 }
 
-func sendMessageToAdmin(bot *tgbotapi.BotAPI, adminID int64, message string) {
-	msg := tgbotapi.NewMessage(adminID, message)
-	_, err := bot.Send(msg)
-	if err != nil {
-		if strings.Contains(err.Error(), "bot can't initiate conversation with a user") {
-			log.Printf("Администратор должен начать диалог с ботом первым: /start")
-			return
-		}
-		log.Printf("Ошибка при отправке сообщения админу: %v", err)
-	}
-}
-
-func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, driveFolderId string, adminID int64) {
-	if message.Photo == nil && message.Video == nil && message.Document == nil {
-		log.Println("Сообщение не содержит медиа")
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Пожалуйста, прикрепите фотографию чека. Используйте /help для просмотра формата.")
-		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Пользователь %s отправил сообщение без медиа файла", getFullName(message.From)))
-		return
-	}
-
-	comment := message.Caption
-	if comment == "" {
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Пожалуйста, добавьте описание к фотографии. Используйте /help для просмотра формата.")
-		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Пользователь %s отправил фото без описания", getFullName(message.From)))
-		return
-	}
-
-	address, amount, commentText, parseErr := parseMessage(comment)
-	if parseErr != nil {
-		log.Printf("Ошибка при парсинге сообщения: %v", parseErr)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так, проверьте правильность заполнения. Обратите внимание на шаблон сообщения и наличие фото. Попробуйте /start чтобы посмотреть справку.")
-		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при парсинге сообщения: %v", parseErr))
-		return
-	}
-
-	moscowOffset := int((3 * time.Hour).Seconds())
-	moscowTime := time.Unix(int64(message.Date), 0).UTC().Add(time.Duration(moscowOffset) * time.Second)
-	dateFormatted := moscowTime.Format("02.01.2006")
-
-	username := getFullName(message.From)
-
-	photo := message.Photo[len(message.Photo)-1]
-	fileID := photo.FileID
-	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
-	if err != nil {
-		log.Printf("Ошибка при получении файла: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при загрузке фотографии. Попробуйте /start чтобы посмотреть справку.")
-		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при получении файла: %v", err))
-		return
-	}
-
-	fileURL := file.Link(bot.Token)
-	resp, err := http.Get(fileURL)
-	if err != nil {
-		log.Printf("Ошибка при скачивании файла: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при скачивании фотографии. Попробуйте /start чтобы посмотреть справку.")
-		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при скачивании файла: %v", err))
-		return
-	}
-	defer resp.Body.Close()
-
-	sanitizedAddress := sanitizeFileName(address)
-	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, dateFormatted)
-
-	tmpFile, err := os.CreateTemp("", "receipt_*_"+fileName)
-	if err != nil {
-		log.Printf("Не удалось создать временный файл: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при сохранении фотографии. Попробуйте /start чтобы посмотреть справку.")
-		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Не удалось создать временный файл: %v", err))
-		return
-	}
-	defer os.Remove(tmpFile.Name())
-
-	_, err = io.Copy(tmpFile, resp.Body)
-	if err != nil {
-		log.Printf("Ошибка при сохранении файла: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при сохранении фотографии. Попробуйте /start чтобы посмотреть справку.")
-		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при сохранении файла: %v", err))
-		return
-	}
-
-	driveLink, err := uploadFileToDrive(driveService, tmpFile.Name(), fileName, driveFolderId)
-	if err != nil {
-		log.Printf("Ошибка при загрузке файла на Drive: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при загрузке фотографии на Drive. Попробуйте /start чтобы посмотреть справку.")
-		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при загрузке файла на Google Drive: %v", err))
-		return
-	}
-
-	parsedData := ParsedData{
-		Address:   address,
-		Amount:    amount,
-		Comment:   commentText,
-		Username:  username,
-		Date:      moscowTime.Format("02/01/2006 15:04:05"), // Сохраняем полный формат для таблицы
-		DriveLink: driveLink,
-	}
-
-	err = appendToSheet(sheetsService, spreadsheetId, parsedData)
-	if err != nil {
-		log.Printf("Ошибка при записи в Google Sheets: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Что-то пошло не так при записи данных в таблицу. Попробуйте /start чтобы посмотреть справку.")
-		bot.Send(reply)
-		sendMessageToAdmin(bot, adminID, fmt.Sprintf("Ошибка при записи в Google Sheets: %v", err))
-		return
-	}
-
-	reply := tgbotapi.NewMessage(message.Chat.ID, "Чек успешно добавлен в таблицу.")
-	bot.Send(reply)
-	log.Println("Данные успешно добавлены в Google Sheets и файл загружен на Drive")
-}
-
 func uploadFileToDrive(service *drive.Service, filePath, fileName, folderId string) (string, error) {
 	var lastErr error
 
@@ -556,20 +454,86 @@ func keepAlive(webhookURL string) {
 }
 
 func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
-	if len(message.Photo) == 0 && len(message.MediaGroupID) == 0 {
+	if len(message.Photo) == 0 {
 		reply := tgbotapi.NewMessage(message.Chat.ID, "Сообщение не содержит фотографии. Попробуйте снова.")
 		bot.Send(reply)
 		return
 	}
 
-	comment := message.Caption
-	address, amount, commentText, parseErr := parseMessage(comment)
+	// Получаем фото с лучшим качеством (последнее в массиве)
+	bestPhoto := message.Photo[len(message.Photo)-1]
+
+	// Определяем часовой пояс Москвы для формирования имени файла
+	moscowOffset := int((3 * time.Hour).Seconds())
+	moscowTime := time.Unix(int64(message.Date), 0).UTC().Add(time.Duration(moscowOffset) * time.Second)
+	dateFormatted := moscowTime.Format("02.01.2006")
+
+	// Обработка медиагруппы
+	if message.MediaGroupID != "" {
+		mediaGroupCacheMu.Lock()
+
+		// Инициализируем группу, если она еще не существует
+		if _, exists := mediaGroupCache[message.MediaGroupID]; !exists {
+			caption := message.Caption
+
+			// Парсим данные только если есть подпись
+			var address, amount, commentText string
+			if caption != "" {
+				var parseErr error
+				address, amount, commentText, parseErr = parseMessage(caption)
+				if parseErr != nil {
+					mediaGroupCacheMu.Unlock()
+					reply := tgbotapi.NewMessage(message.Chat.ID, "Не удалось распознать подпись к фото. Проверьте формат данных.")
+					bot.Send(reply)
+					return
+				}
+			}
+
+			mediaGroupCache[message.MediaGroupID] = &MediaGroupData{
+				Files:       make(map[string]bool),
+				Caption:     caption,
+				Address:     address,
+				Amount:      amount,
+				Comment:     commentText,
+				LastUpdated: time.Now(),
+				UserID:      message.From.ID,
+				ChatID:      message.Chat.ID,
+				Username:    getFullName(message.From),
+			}
+
+			// Запускаем таймер для очистки кэша
+			go func(mediaGroupID string) {
+				time.Sleep(1 * time.Minute) // Ожидаем 1 минуту
+				mediaGroupExpiryCh <- mediaGroupID
+			}(message.MediaGroupID)
+		}
+
+		// Добавляем файл в группу, если его еще нет
+		if _, processed := mediaGroupCache[message.MediaGroupID].Files[bestPhoto.FileID]; !processed {
+			mediaGroupCache[message.MediaGroupID].Files[bestPhoto.FileID] = false
+			mediaGroupCache[message.MediaGroupID].LastUpdated = time.Now()
+		}
+
+		mediaGroupCacheMu.Unlock()
+
+		// Обрабатываем группу, если пришло фото с подписью или это первое фото группы
+		if message.Caption != "" || len(mediaGroupCache[message.MediaGroupID].Files) == 1 {
+			go processMediaGroup(bot, message.MediaGroupID, sheetsService, spreadsheetId, driveService, parentFolderId, adminID)
+		}
+
+		return
+	}
+
+	// Обработка одиночного фото
+	caption := message.Caption
+	address, amount, commentText, parseErr := parseMessage(caption)
 	if parseErr != nil {
 		reply := tgbotapi.NewMessage(message.Chat.ID, "Не удалось распознать подпись к фото. Проверьте формат данных.")
 		bot.Send(reply)
 		return
 	}
 
+	// Создаем или получаем ID папки объекта на Google Drive
 	objectFolderID, err := ensureObjectFolder(driveService, parentFolderId, address)
 	if err != nil {
 		log.Printf("Ошибка создания папки для объекта: %v", err)
@@ -578,60 +542,33 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 		return
 	}
 
-	var links []string
-	bestPhoto := message.Photo[len(message.Photo)-1]
+	// Загружаем одиночное фото
+	sanitizedAddress := sanitizeFileName(address)
 	photoFile, err := bot.GetFile(tgbotapi.FileConfig{FileID: bestPhoto.FileID})
 	if err != nil {
 		log.Printf("Ошибка загрузки файла: %v", err)
-		return
-	}
-	fileURL := photoFile.Link(bot.Token)
-
-	resp, err := http.Get(fileURL)
-	if err != nil {
-		log.Printf("Ошибка скачивания файла: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	moscowOffset := int((3 * time.Hour).Seconds())
-	moscowTime := time.Unix(int64(message.Date), 0).UTC().Add(time.Duration(moscowOffset) * time.Second)
-	sanitizedAddress := sanitizeFileName(address)
-	dateFormatted := moscowTime.Format("02.01.2006")
-
-	fileName := sanitizeFileName(fmt.Sprintf("%s_%s_%s.jpg", sanitizedAddress, dateFormatted, amount))
-	tmpFile, err := os.CreateTemp("", fileName)
-	if err != nil {
-		log.Printf("Ошибка создания временного файла: %v", err)
-		return
-	}
-	defer os.Remove(tmpFile.Name())
-
-	if _, err = io.Copy(tmpFile, resp.Body); err != nil {
-		log.Printf("Ошибка копирования файла: %v", err)
-		return
-	}
-
-	link, err := uploadFileToDrive(driveService, tmpFile.Name(), fileName, objectFolderID)
-	if err != nil {
-		log.Printf("Ошибка загрузки файла на Google Drive: %v", err)
-		return
-	}
-	links = append(links, link)
-
-	if len(links) == 0 {
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Не удалось загрузить фотографии. Попробуйте снова.")
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Ошибка загрузки файла. Попробуйте позже.")
 		bot.Send(reply)
 		return
 	}
 
+	fileURL := photoFile.Link(bot.Token)
+	link, err := downloadAndUploadFile(fileURL, sanitizedAddress, dateFormatted, amount, driveService, objectFolderID)
+	if err != nil {
+		log.Printf("Ошибка при обработке файла: %v", err)
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Ошибка загрузки файла на Google Drive. Попробуйте позже.")
+		bot.Send(reply)
+		return
+	}
+
+	// Добавляем данные в Google Sheets
 	parsedData := ParsedData{
 		Address:   address,
 		Amount:    amount,
 		Comment:   commentText,
 		Username:  getFullName(message.From),
 		Date:      time.Now().Format("02/01/2006 15:04:05"),
-		DriveLink: strings.Join(links, " "),
+		DriveLink: link,
 	}
 
 	if err := appendToSheet(sheetsService, spreadsheetId, parsedData); err != nil {
@@ -641,29 +578,253 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 		return
 	}
 
-	reply := tgbotapi.NewMessage(message.Chat.ID, "Фотографии успешно добавлены.")
+	reply := tgbotapi.NewMessage(message.Chat.ID, "Фотография успешно обработана.")
 	bot.Send(reply)
 }
 
-func ensureObjectFolder(service *drive.Service, parentFolderId, objectName string) (string, error) {
-	query := fmt.Sprintf("name = '%s' and mimeType = 'application/vnd.google-apps.folder' and '%s' in parents", objectName, parentFolderId)
-	fileList, err := service.Files.List().Q(query).Fields("files(id)").Do()
-	if err != nil {
-		return "", err
+func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
+	time.Sleep(1 * time.Second)
+
+	mediaGroupCacheMu.Lock()
+	groupData, exists := mediaGroupCache[mediaGroupID]
+	if !exists {
+		mediaGroupCacheMu.Unlock()
+		log.Printf("Ошибка: медиагруппа %s не найдена в кэше", mediaGroupID)
+		return
 	}
+
+	hasUnprocessedFiles := false
+	for _, processed := range groupData.Files {
+		if !processed {
+			hasUnprocessedFiles = true
+			break
+		}
+	}
+
+	if !hasUnprocessedFiles || len(groupData.Files) == 0 {
+		mediaGroupCacheMu.Unlock()
+		return
+	}
+
+	address := groupData.Address
+	amount := groupData.Amount
+	commentText := groupData.Comment
+	chatID := groupData.ChatID
+	username := groupData.Username
+
+	unprocessedFileIDs := make([]string, 0)
+	for fileID, processed := range groupData.Files {
+		if !processed {
+			unprocessedFileIDs = append(unprocessedFileIDs, fileID)
+		}
+	}
+	mediaGroupCacheMu.Unlock()
+
+	if len(unprocessedFileIDs) == 0 {
+		return
+	}
+
+	objectFolderID, err := ensureObjectFolder(driveService, parentFolderId, address)
+	if err != nil {
+		log.Printf("Ошибка создания папки для объекта: %v", err)
+		reply := tgbotapi.NewMessage(chatID, "Ошибка обработки объекта. Попробуйте позже.")
+		bot.Send(reply)
+		return
+	}
+
+	var links []string
+	successCount := 0
+	moscowOffset := int((3 * time.Hour).Seconds())
+	moscowTime := time.Now().UTC().Add(time.Duration(moscowOffset) * time.Second)
+	dateFormatted := moscowTime.Format("02.01.2006")
+	sanitizedAddress := sanitizeFileName(address)
+
+	for i, fileID := range unprocessedFileIDs {
+		photoFile, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
+		if err != nil {
+			log.Printf("Ошибка загрузки файла из медиагруппы (ID: %s): %v", fileID, err)
+			continue
+		}
+
+		fileURL := photoFile.Link(bot.Token)
+
+		indexedFileName := fmt.Sprintf("%s_%d", sanitizedAddress, i+1)
+		link, err := downloadAndUploadFile(fileURL, indexedFileName, dateFormatted, amount, driveService, objectFolderID)
+		if err != nil {
+			log.Printf("Ошибка при обработке файла из медиагруппы: %v", err)
+		} else {
+			links = append(links, link)
+			successCount++
+
+			mediaGroupCacheMu.Lock()
+			if group, exists := mediaGroupCache[mediaGroupID]; exists {
+				group.Files[fileID] = true
+			}
+			mediaGroupCacheMu.Unlock()
+		}
+	}
+
+	if len(links) == 0 {
+		reply := tgbotapi.NewMessage(chatID, "Не удалось загрузить фотографии. Попробуйте снова.")
+		bot.Send(reply)
+		return
+	}
+
+	parsedData := ParsedData{
+		Address:   address,
+		Amount:    amount,
+		Comment:   commentText,
+		Username:  username,
+		Date:      time.Now().Format("02/01/2006 15:04:05"),
+		DriveLink: strings.Join(links, " "),
+	}
+
+	if err := appendToSheet(sheetsService, spreadsheetId, parsedData); err != nil {
+		log.Printf("Ошибка записи в Google Sheets: %v", err)
+		reply := tgbotapi.NewMessage(chatID, "Ошибка записи данных. Попробуйте позже.")
+		bot.Send(reply)
+		return
+	}
+
+	successMessage := fmt.Sprintf("Успешно обработано %d фото из медиагруппы.", successCount)
+	reply := tgbotapi.NewMessage(chatID, successMessage)
+	bot.Send(reply)
+}
+
+func startMediaGroupCacheCleaner() {
+	go func() {
+		for mediaGroupID := range mediaGroupExpiryCh {
+			mediaGroupCacheMu.Lock()
+			delete(mediaGroupCache, mediaGroupID)
+			mediaGroupCacheMu.Unlock()
+			log.Printf("Медиагруппа %s удалена из кэша", mediaGroupID)
+		}
+	}()
+}
+
+func downloadAndUploadFile(fileURL, baseName, dateFormatted, amount string, driveService *drive.Service, objectFolderID string) (string, error) {
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		return "", fmt.Errorf("ошибка скачивания файла: %v", err)
+	}
+	defer resp.Body.Close()
+
+	fileName := sanitizeFileName(fmt.Sprintf("%s_%s_%s.jpg", baseName, dateFormatted, amount))
+	tmpFile, err := os.CreateTemp("", fileName)
+	if err != nil {
+		return "", fmt.Errorf("ошибка создания временного файла: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err = io.Copy(tmpFile, resp.Body); err != nil {
+		return "", fmt.Errorf("ошибка копирования файла: %v", err)
+	}
+	tmpFile.Close()
+
+	link, err := uploadFileToDrive(driveService, tmpFile.Name(), fileName, objectFolderID)
+	if err != nil {
+		return "", fmt.Errorf("ошибка загрузки файла на Google Drive: %v", err)
+	}
+
+	return link, nil
+}
+
+func ensureObjectFolder(service *drive.Service, parentFolderId, objectName string) (string, error) {
+	sanitizedObjectName := strings.TrimSpace(objectName)
+
+	if sanitizedObjectName == "" {
+		sanitizedObjectName = "Разное"
+	}
+
+	sanitizedObjectName = sanitizeFileName(sanitizedObjectName)
+
+	query := fmt.Sprintf("name = '%s' and mimeType = 'application/vnd.google-apps.folder' and '%s' in parents and trashed = false",
+		sanitizedObjectName, parentFolderId)
+
+	var fileList *drive.FileList
+	var err error
+
+	for i := 0; i < maxRetries; i++ {
+		fileList, err = service.Files.List().
+			Q(query).
+			Fields("files(id, name)").
+			PageSize(10).
+			Do()
+
+		if err == nil {
+			break
+		}
+
+		log.Printf("Попытка %d поиска папки объекта не удалась: %v", i+1, err)
+
+		if strings.Contains(err.Error(), "oauth2: token expired") {
+			newClient, cErr := getClient(oauthConfig)
+			if cErr != nil {
+				log.Printf("Не удалось обновить клиент: %v", cErr)
+			} else {
+				newService, sErr := drive.NewService(context.Background(), option.WithHTTPClient(newClient))
+				if sErr != nil {
+					log.Printf("Не удалось создать новый Drive сервис: %v", sErr)
+				} else {
+					service = newService
+					continue
+				}
+			}
+		}
+
+		time.Sleep(time.Duration(retryDelay*(i+1)) * time.Second)
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("не удалось выполнить поиск папки после %d попыток: %v", maxRetries, err)
+	}
+
 	if len(fileList.Files) > 0 {
+		log.Printf("Найдена существующая папка объекта '%s' (ID: %s)", sanitizedObjectName, fileList.Files[0].Id)
 		return fileList.Files[0].Id, nil
 	}
 
+	log.Printf("Создаём новую папку объекта '%s'", sanitizedObjectName)
+
 	folder := &drive.File{
-		Name:     objectName,
+		Name:     sanitizedObjectName,
 		Parents:  []string{parentFolderId},
 		MimeType: "application/vnd.google-apps.folder",
 	}
-	createdFolder, err := service.Files.Create(folder).Fields("id").Do()
-	if err != nil {
-		return "", err
+
+	var createdFolder *drive.File
+
+	for i := 0; i < maxRetries; i++ {
+		createdFolder, err = service.Files.Create(folder).Fields("id, name").Do()
+		if err == nil {
+			break
+		}
+
+		log.Printf("Попытка %d создания папки объекта не удалась: %v", i+1, err)
+
+		if strings.Contains(err.Error(), "oauth2: token expired") {
+			newClient, cErr := getClient(oauthConfig)
+			if cErr != nil {
+				log.Printf("Не удалось обновить клиент: %v", cErr)
+			} else {
+				newService, sErr := drive.NewService(context.Background(), option.WithHTTPClient(newClient))
+				if sErr != nil {
+					log.Printf("Не удалось создать новый Drive сервис: %v", sErr)
+				} else {
+					service = newService
+					continue
+				}
+			}
+		}
+
+		time.Sleep(time.Duration(retryDelay*(i+1)) * time.Second)
 	}
+
+	if err != nil {
+		return "", fmt.Errorf("не удалось создать папку объекта после %d попыток: %v", maxRetries, err)
+	}
+
+	log.Printf("Успешно создана папка объекта '%s' (ID: %s)", sanitizedObjectName, createdFolder.Id)
 	return createdFolder.Id, nil
 }
 
@@ -749,6 +910,9 @@ func main() {
 	}
 	log.Printf("Webhook установлен на %s", webhookURL)
 	keepAlive(webhookURL)
+
+	startMediaGroupCacheCleaner()
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
 			bytes, _ := ioutil.ReadAll(r.Body)
