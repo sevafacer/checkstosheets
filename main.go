@@ -248,52 +248,33 @@ func getFullName(user *tgbotapi.User) string {
 }
 
 func parseMessage(message string) (address string, amount string, comment string, err error) {
-	if message == "" {
+	// Проверка на пустое сообщение
+	if strings.TrimSpace(message) == "" {
 		return "", "", "", errors.New("пустое сообщение")
 	}
 
-	dataMap := make(map[string]string)
-	scenario := 0
+	normalized := strings.Join(strings.Fields(message), " ")
 
-	messageLine := strings.ReplaceAll(message, "\n", " ")
+	addressPattern := strings.Join(fieldKeywords["address"], "|")
+	amountPattern := strings.Join(fieldKeywords["amount"], "|")
+	commentPattern := strings.Join(fieldKeywords["comment"], "|")
 
-	// === Уточненный парсинг с ключевыми словами ===
-	parsedWithKeywords := false
-	for field, keywords := range fieldKeywords {
-		for _, keyword := range keywords {
-			var re *regexp.Regexp
-			if field == "address" {
-				// Для адреса, заканчиваем захват перед ключевыми словами "сумма" или "комментарий" (или концом строки)
-				amountKeywordsRegex := strings.Join(fieldKeywords["amount"], "|")
-				commentKeywordsRegex := strings.Join(fieldKeywords["comment"], "|")
-				re = regexp.MustCompile(fmt.Sprintf(`(?i)(%s\s*[:=])\s*([^\s].*?)(\s+(?:%s|%s)[:=]|\s*$|$)`, regexp.QuoteMeta(keyword), amountKeywordsRegex, commentKeywordsRegex))
+	addressRegex := regexp.MustCompile(`(?i)(?:` + addressPattern + `)\s*[:=]\s*(.+?)(?=\s+(?:` + amountPattern + `|` + commentPattern + `)\s*[:=]|$)`)
+	amountRegex := regexp.MustCompile(`(?i)(?:` + amountPattern + `)\s*[:=]\s*(.+?)(?=\s+(?:` + commentPattern + `)\s*[:=]|$)`)
+	commentRegex := regexp.MustCompile(`(?i)(?:` + commentPattern + `)\s*[:=]\s*(.+)$`)
 
-			} else if field == "amount" {
-				// Для суммы, заканчиваем захват перед ключевыми словами "комментарий" или концом строки
-				commentKeywordsRegex := strings.Join(fieldKeywords["comment"], "|")
-				re = regexp.MustCompile(fmt.Sprintf(`(?i)(%s\s*[:=])\s*([^\s].*?)(\s+(?:%s)[:=]|\s*$)`, regexp.QuoteMeta(keyword), commentKeywordsRegex))
-			} else { // Для комментария - захватываем все, что осталось до конца строки
-				re = regexp.MustCompile(fmt.Sprintf(`(?i)(%s\s*[:=])\s*(.+)`, regexp.QuoteMeta(keyword)))
-			}
-
-			matches := re.FindStringSubmatch(messageLine)
-			if len(matches) > 0 {
-				value := strings.TrimSpace(matches[2])
-				dataMap[field] = value
-				parsedWithKeywords = true
-				scenario = 1
-			}
-		}
+	if m := addressRegex.FindStringSubmatch(normalized); len(m) > 1 {
+		address = strings.TrimSpace(m[1])
+	}
+	if m := amountRegex.FindStringSubmatch(normalized); len(m) > 1 {
+		amount = cleanAmount(strings.TrimSpace(m[1]))
+	}
+	if m := commentRegex.FindStringSubmatch(normalized); len(m) > 1 {
+		comment = strings.TrimSpace(m[1])
 	}
 
-	if parsedWithKeywords {
-		// Сценарий с ключевыми словами
-		address = dataMap["address"]
-		amount = dataMap["amount"]
-		comment = dataMap["comment"]
-	} else {
-		scenario = 2                          // Сценарий без ключевых слов (если не распознались ключевые слова)
-		lines := strings.Split(message, "\n") // Возвращаем разделение на строки для сценария без ключевых слов
+	if address == "" || amount == "" {
+		lines := strings.Split(message, "\n")
 		if len(lines) > 0 {
 			address = strings.TrimSpace(lines[0])
 		}
@@ -305,10 +286,8 @@ func parseMessage(message string) (address string, amount string, comment string
 		}
 	}
 
-	if address == "" || amount == "" && scenario != 0 {
+	if address == "" || amount == "" {
 		return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
-	} else if scenario == 0 {
-		return "", "", "", errors.New("не удалось распознать формат сообщения")
 	}
 
 	return address, amount, comment, nil
