@@ -649,6 +649,7 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 
 		return
 	}
+
 	// Обработка одиночного фото (без изменений)
 	caption := message.Caption
 	address, amount, commentText, parseErr := parseMessage(caption)
