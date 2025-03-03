@@ -380,7 +380,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	defer resp.Body.Close()
 
 	sanitizedAddress := sanitizeFileName(address)
-	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, sanitizedAddress)
+	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, dateFormatted)
 
 	tmpFile, err := os.CreateTemp("", "receipt_*_"+fileName)
 	if err != nil {
