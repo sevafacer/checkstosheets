@@ -924,18 +924,19 @@ func main() {
 				return
 			}
 
-			if update.Message.IsCommand() {
-				switch update.Message.Command() {
-				case "start", "help":
-					helpText := `Привет! Я бот позволяющий грамотно отслеживать все чеки. Вот как меня использовать:
+			if update.Message != nil {
+				if update.Message.IsCommand() {
+					switch update.Message.Command() {
+					case "start", "help":
+						helpText := `Привет! Я бот позволяющий грамотно отслеживать все чеки. Вот как меня использовать:
 
 1. Прикрепите фотографию чека (Четкую и качественную)
 2. В подписи к фото укажите:
    Адрес: [адрес]
    Сумма: [сумма]
    Комментарий: [ваш комментарий] (необязательно) 
-	 
-	 или
+     
+     или
 
    Адрес [адрес]
    Сумма [сумма]
@@ -950,17 +951,18 @@ func main() {
 Сумма 1500 руб
 Комментарий Оплата за сентябрь`
 
-					msg := tgbotapi.NewMessage(update.Message.Chat.ID, helpText)
-					bot.Send(msg)
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, helpText)
+						bot.Send(msg)
+					}
+				} else if update.Message.Photo != nil || update.Message.MediaGroupID != "" {
+					semaphore <- struct{}{}
+					wg.Add(1)
+					go func(message *tgbotapi.Message) {
+						defer wg.Done()
+						handleMediaGroupMessage(bot, message, sheetsService, spreadsheetId, driveService, driveFolderId, adminID)
+						<-semaphore
+					}(update.Message)
 				}
-			} else {
-				semaphore <- struct{}{}
-				wg.Add(1)
-				go func(message *tgbotapi.Message) {
-					defer wg.Done()
-					handleMediaGroupMessage(bot, message, sheetsService, spreadsheetId, driveService, driveFolderId, adminID)
-					<-semaphore
-				}(update.Message)
 			}
 
 			w.WriteHeader(http.StatusOK)
