@@ -444,7 +444,7 @@ func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedDat
 		data.Username, data.Address,
 		data.Amount,
 		data.Comment,
-		nil, // DriveLink будет заполнен Rich Text
+		formatDriveLinksForSheet(data.DriveLink), // Используем функцию форматирования ссылок
 	}
 
 	vr := &sheets.ValueRange{
@@ -467,34 +467,12 @@ func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedDat
 		ValueInputOption("USER_ENTERED").
 		Do()
 	if err != nil {
-		return fmt.Errorf("не удалось обновить Google Sheets (основные значения): %v", err)
+		return fmt.Errorf("не удалось обновить Google Sheets: %v", err)
 	}
 
-	// --- Rich Text обновление ячейки DriveLink ---
-	cellData := formatDriveLinksForSheet(data.DriveLink)
-
-	batchUpdateRequest := &sheets.BatchUpdateSpreadsheetRequest{
+	formatRequest := sheets.BatchUpdateSpreadsheetRequest{
 		Requests: []*sheets.Request{
 			{
-				UpdateCells: &sheets.UpdateCellsRequest{
-					Rows: []*sheets.RowData{
-						{
-							Values: []*sheets.CellData{
-								cellData,
-							},
-						},
-					},
-					Fields: "userEnteredValue.formattedValue,userEnteredValue.richTextValue",
-					Range: &sheets.GridRange{
-						SheetId:          sheetIDPropID, // ID листа
-						StartRowIndex:    int64(lastRow - 1),
-						EndRowIndex:      int64(lastRow),
-						StartColumnIndex: 5, // Индекс столбца для DriveLink (F = 5, G = 6, ...) - проверьте свой столбец!
-						EndColumnIndex:   6,
-					},
-				},
-			},
-			{ // Форматирование числового значения (сумма) - как было ранее
 				RepeatCell: &sheets.RepeatCellRequest{
 					Range: &sheets.GridRange{
 						SheetId:          sheetIDPropID,
@@ -517,89 +495,32 @@ func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedDat
 		},
 	}
 
-	_, err = service.Spreadsheets.BatchUpdate(spreadsheetId, batchUpdateRequest).Do()
+	_, err = service.Spreadsheets.BatchUpdate(spreadsheetId, &formatRequest).Do()
 	if err != nil {
-		return fmt.Errorf("не удалось выполнить BatchUpdate Google Sheets (Rich Text и форматирование): %v", err)
+		log.Printf("Предупреждение: не удалось установить форматирование: %v", err)
 	}
 
 	return nil
 }
 
 // formatDriveLinksForSheet формирует Rich Text для Google Sheets для отображения нескольких ссылок.
-func formatDriveLinksForSheet(driveLinks string) *sheets.CellData {
-	cellData := &sheets.CellData{
-		UserEnteredValue: &sheets.ExtendedValue{
-			Type: "RICH_TEXT",
-			RichTextValue: &sheets.RichTextValue{
-				Text:           "",
-				TextFormatRuns: []*sheets.TextFormatRun{},
-			},
-		},
-	}
-
+func formatDriveLinksForSheet(driveLinks string) string {
 	links := strings.Split(strings.TrimSpace(driveLinks), " ") // Разделяем ссылки по пробелу
-	if len(links) == 0 {
-		return cellData // Возвращаем пустой Rich Text, если нет ссылок
+	if len(links) == 1 {
+		return driveLinks // Если ссылка одна, возвращаем как есть
 	}
 
-	var textRuns []*sheets.TextFormatRun
-	combinedText := ""
-
-	for i, link := range links {
+	var formulaParts []string
+	for _, link := range links {
 		if link != "" {
-			startIndex := utf8Len(combinedText) // Вычисляем индекс начала ссылки
-
-			text := "Чек" // Текст ссылки
-			combinedText += text
-			if i < len(links)-1 {
-				combinedText += ", " // Добавляем разделитель ", " между ссылками
-			}
-
-			textRun := &sheets.TextFormatRun{
-				StartIndex: int64Ptr(startIndex),
-				Format: &sheets.TextFormat{
-					Link: &sheets.Link{
-						Uri: link,
-					},
-				},
-				Text: text,
-			}
-			textRuns = append(textRuns, textRun)
+			formulaParts = append(formulaParts, fmt.Sprintf(`HYPERLINK("%s", "%s")`, link, "Чек")) // "Чек" как текст ссылки
 		}
 	}
 
-	// Добавляем TextFormatRun с общим текстом (без ссылок) в начале, если нужно
-	if utf8Len(combinedText) > 0 { // Добавляем TextFormatRun только если есть текст
-		mainTextRun := &sheets.TextFormatRun{
-			Text: combinedText,
-		}
-
-		var allTextRuns []*sheets.TextFormatRun
-		allTextRuns = append(allTextRuns, mainTextRun)
-
-		// Вставляем форматирование ссылок *внутри* mainTextRun, изменяя диапазоны
-		for _, linkRun := range textRuns {
-			linkRun.StartIndex = int64Ptr(*linkRun.StartIndex) // Ensure start index is relative to the *main* text
-			allTextRuns = append(allTextRuns, linkRun)
-		}
-		cellData.UserEnteredValue.RichTextValue.TextFormatRuns = allTextRuns
-
-		// Устанавливаем общий текст для Rich Text (весь объединенный текст)
-		cellData.UserEnteredValue.RichTextValue.Text = combinedText
-
+	if len(formulaParts) > 0 {
+		return "=TEXTJOIN(\", \", TRUE, " + strings.Join(formulaParts, ", ") + ")" // TEXTJOIN для объединения гиперссылок
 	}
-
-	return cellData
-}
-
-// Helper function to get UTF-8 string length correctly for Google Sheets API
-func utf8Len(s string) int64 {
-	return int64(len([]rune(s)))
-}
-
-// Helper function to get pointer to int64
-func int64Ptr(val int64) *int64 {
-	return &val
+	return driveLinks // Если нет ссылок, возвращаем исходную строку (или пустую)
 }
 
 // --- Функции Telegram Bot ---
@@ -651,7 +572,7 @@ func worker(taskQueue <-chan FileTask, resultsChan chan<- FileResult, driveServi
 }
 
 // --- Обработчики сообщений Telegram ---
-// ... (handleMediaGroupMessage - без изменений) ...
+// ... (handleMediaGroupMessage - с усиленным логированием) ...
 func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
 	if len(message.Photo) == 0 {
 		reply := tgbotapi.NewMessage(message.Chat.ID, "Сообщение не содержит фотографии. Попробуйте снова.")
@@ -661,6 +582,9 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 
 	// Получаем фото с лучшим качеством (последнее в массиве)
 	bestPhoto := message.Photo[len(message.Photo)-1]
+
+	// ===  Добавлено логирование количества фото в сообщении ===
+	log.Printf("handleMediaGroupMessage: Получено сообщение. Количество фото в message.Photo: %d, MediaGroupID: %s, FileID текущего фото: %s", len(message.Photo), message.MediaGroupID, bestPhoto.FileID)
 
 	// Определяем часовой пояс Москвы для формирования имени файла
 	moscowOffset := int((3 * time.Hour).Seconds())
@@ -713,6 +637,9 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 			mediaGroupCache[message.MediaGroupID].LastUpdated = time.Now()
 		}
 
+		// === Добавлено логирование размера кэша после добавления файла ===
+		log.Printf("handleMediaGroupMessage: Файл FileID: %s добавлен в кэш медиагруппы %s. Текущий размер кэша медиагруппы: %d", bestPhoto.FileID, message.MediaGroupID, len(mediaGroupCache[message.MediaGroupID].Files))
+
 		mediaGroupCacheMu.Unlock()
 
 		// Обрабатываем группу, если пришло фото с подписью или это первое фото группы
@@ -722,7 +649,6 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 
 		return
 	}
-
 	// Обработка одиночного фото (без изменений)
 	caption := message.Caption
 	address, amount, commentText, parseErr := parseMessage(caption)
@@ -799,7 +725,7 @@ func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService 
 	groupData, exists := mediaGroupCache[mediaGroupID]
 	if !exists {
 		mediaGroupCacheMu.Unlock()
-		log.Printf("processMediaGroup: Ошибка: медиагруппа %s не найдена в кэше", mediaGroupID)
+		log.Printf("Ошибка: медиагруппа %s не найдена в кэше", mediaGroupID)
 		return
 	}
 
@@ -851,7 +777,7 @@ func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService 
 
 	objectFolderID, err := ensureObjectFolder(driveService, parentFolderId, address)
 	if err != nil {
-		log.Printf("processMediaGroup: Ошибка создания папки для объекта: %v", err)
+		log.Printf("Ошибка создания папки для объекта: %v", err)
 		reply := tgbotapi.NewMessage(chatID, "Ошибка обработки объекта. Попробуйте позже.")
 		bot.Send(reply)
 		return
@@ -907,10 +833,9 @@ func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService 
 
 	log.Printf("processMediaGroup: Ожидаем результаты из resultsChan для %d задач медиагруппы %s", len(tasks), mediaGroupID) // Лог начала ожидания результатов
 
-	for i := 0; i < len(tasks); i++ { // *** Цикл for i := 0; i < len(tasks); i++ ***
+	for i := 0; i < len(tasks); i++ { // *** Исправлено: цикл for i := 0; i < len(tasks); i++ ***
 		result := <-resultsChan
-		log.Printf("processMediaGroup: Получен результат из resultsChan [%d/%d] для FileID: %s, DriveLink: %s, Error: %v", i+1, len(tasks), result.FileID, result.DriveLink, result.Error) // Лог получения результата с индексом
-
+		log.Printf("processMediaGroup: Получен результат из resultsChan для FileID: %s, DriveLink: %s, Error: %v", result.FileID, result.DriveLink, result.Error) // Лог получения результата
 		if result.Error != nil {
 			log.Printf("processMediaGroup: Ошибка обработки файла из worker pool, FileID: %s, ошибка: %v", result.FileID, result.Error)
 		} else {
@@ -918,8 +843,6 @@ func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService 
 			successCount++
 			processedFiles[result.FileID] = true // Помечаем FileID как обработанный
 		}
-		log.Printf("processMediaGroup: Статистика после обработки [%d/%d]: successCount=%d, len(links)=%d", i+1, len(tasks), successCount, len(links)) // Лог статистики после каждой итерации
-
 	}
 	close(resultsChan)                                                                                                                                           // Закрываем resultsChan после сбора всех результатов
 	log.Printf("processMediaGroup: resultsChan закрыт для медиагруппы %s, всего получено результатов: %d, успешных: %d", mediaGroupID, len(tasks), successCount) // Лог закрытия resultsChan и статистики
@@ -1008,7 +931,7 @@ func downloadAndUploadFile(fileURL, baseName, dateFormatted, amount string, driv
 }
 
 // --- Функции парсинга ---
-// ... (getFullName, fieldMatch, removeLeadingKeyword, fallbackParse, parseMessage, cleanAmount, sanitizeFileName, utf8Len, int64Ptr - без изменений) ...
+// ... (getFullName, fieldMatch, removeLeadingKeyword, fallbackParse, parseMessage, cleanAmount, sanitizeFileName - без изменений) ...
 func getFullName(user *tgbotapi.User) string {
 	if user.LastName != "" {
 		return fmt.Sprintf("%s %s", user.FirstName, user.LastName)
@@ -1168,16 +1091,6 @@ func sanitizeFileName(name string) string {
 	sanitized = strings.Trim(sanitized, "_")
 
 	return sanitized
-}
-
-// Helper function to get UTF-8 string length correctly for Google Sheets API
-func utf8Len(s string) int64 {
-	return int64(len([]rune(s)))
-}
-
-// Helper function to get pointer to int64
-func int64Ptr(val int64) *int64 {
-	return &val
 }
 
 // --- Основная функция main ---
