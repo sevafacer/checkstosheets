@@ -253,22 +253,35 @@ func parseMessage(message string) (address string, amount string, comment string
 	}
 
 	dataMap := make(map[string]string)
-	scenario := 0 // 0 - не определен, 1 - ключевые слова, 2 - без ключевых слов
+	scenario := 0
 
-	lines := strings.Split(message, "\n")
+	messageLine := strings.ReplaceAll(message, "\n", " ")
 
-	// === Попытка парсинга с ключевыми словами (обновлено для обработки одной строки) ===
+	// === Уточненный парсинг с ключевыми словами ===
 	parsedWithKeywords := false
-	messageLine := strings.ReplaceAll(message, "\n", " ") // Объединяем все строки в одну для обработки ключевых слов
 	for field, keywords := range fieldKeywords {
 		for _, keyword := range keywords {
-			re := regexp.MustCompile(fmt.Sprintf(`(?i)(%s\s*[:=])\s*([^\s].*?)(?:\s+(?:\w+[:=]|$)|$)`, regexp.QuoteMeta(keyword))) // Regex для поиска значений после ключевого слова
+			var re *regexp.Regexp
+			if field == "address" {
+				// Для адреса, заканчиваем захват перед ключевыми словами "сумма" или "комментарий" (или концом строки)
+				amountKeywordsRegex := strings.Join(fieldKeywords["amount"], "|")
+				commentKeywordsRegex := strings.Join(fieldKeywords["comment"], "|")
+				re = regexp.MustCompile(fmt.Sprintf(`(?i)(%s\s*[:=])\s*([^\s].*?)(\s+(?:%s|%s)[:=]|\s*$|$)`, regexp.QuoteMeta(keyword), amountKeywordsRegex, commentKeywordsRegex))
+
+			} else if field == "amount" {
+				// Для суммы, заканчиваем захват перед ключевыми словами "комментарий" или концом строки
+				commentKeywordsRegex := strings.Join(fieldKeywords["comment"], "|")
+				re = regexp.MustCompile(fmt.Sprintf(`(?i)(%s\s*[:=])\s*([^\s].*?)(\s+(?:%s)[:=]|\s*$)`, regexp.QuoteMeta(keyword), commentKeywordsRegex))
+			} else { // Для комментария - захватываем все, что осталось до конца строки
+				re = regexp.MustCompile(fmt.Sprintf(`(?i)(%s\s*[:=])\s*(.+)`, regexp.QuoteMeta(keyword)))
+			}
+
 			matches := re.FindStringSubmatch(messageLine)
 			if len(matches) > 0 {
-				value := strings.TrimSpace(matches[2]) // Значение теперь в matches[2]
+				value := strings.TrimSpace(matches[2])
 				dataMap[field] = value
 				parsedWithKeywords = true
-				scenario = 1 // Определен сценарий с ключевыми словами
+				scenario = 1
 			}
 		}
 	}
@@ -278,9 +291,9 @@ func parseMessage(message string) (address string, amount string, comment string
 		address = dataMap["address"]
 		amount = dataMap["amount"]
 		comment = dataMap["comment"]
-
-	} else { // Если не удалось разобрать как ключевые слова, пробуем сценарий без ключевых слов
-		scenario = 2 // Сценарий без ключевых слов по умолчанию, если не распознаны ключевые слова
+	} else {
+		scenario = 2                          // Сценарий без ключевых слов (если не распознались ключевые слова)
+		lines := strings.Split(message, "\n") // Возвращаем разделение на строки для сценария без ключевых слов
 		if len(lines) > 0 {
 			address = strings.TrimSpace(lines[0])
 		}
@@ -292,10 +305,10 @@ func parseMessage(message string) (address string, amount string, comment string
 		}
 	}
 
-	if address == "" || amount == "" && scenario != 0 { // Проверка обязательных полей для обоих сценариев, кроме случая, когда сценарий не определен
+	if address == "" || amount == "" && scenario != 0 {
 		return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
 	} else if scenario == 0 {
-		return "", "", "", errors.New("не удалось распознать формат сообщения") // Добавлена ошибка для неопределенного сценария
+		return "", "", "", errors.New("не удалось распознать формат сообщения")
 	}
 
 	return address, amount, comment, nil
@@ -527,6 +540,19 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 		return
 	}
 
+	// ===  Добавляем проверку на заполненность адреса и суммы ===
+	if address == "" {
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Пожалуйста, введите адрес объекта.")
+		bot.Send(reply)
+		return
+	}
+	if amount == "" {
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Пожалуйста, введите сумму.")
+		bot.Send(reply)
+		return
+	}
+	// === Конец проверки ===
+
 	// Создаем или получаем ID папки объекта на Google Drive
 	objectFolderID, err := ensureObjectFolder(driveService, parentFolderId, address)
 	if err != nil {
@@ -604,6 +630,21 @@ func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService 
 	chatID := groupData.ChatID
 	username := groupData.Username
 
+	// === Добавляем проверку на заполненность адреса и суммы ===
+	if address == "" {
+		reply := tgbotapi.NewMessage(chatID, "Пожалуйста, введите адрес объекта.")
+		bot.Send(reply)
+		mediaGroupCacheMu.Unlock() // Важно разблокировать мьютекс перед выходом
+		return
+	}
+	if amount == "" {
+		reply := tgbotapi.NewMessage(chatID, "Пожалуйста, введите сумму.")
+		bot.Send(reply)
+		mediaGroupCacheMu.Unlock() // Важно разблокировать мьютекс перед выходом
+		return
+	}
+	// === Конец проверки ===
+
 	unprocessedFileIDs := make([]string, 0)
 	for fileID, processed := range groupData.Files {
 		if !processed {
@@ -668,7 +709,7 @@ func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService 
 		Comment:   commentText,
 		Username:  username,
 		Date:      time.Now().Format("02/01/2006 15:04:05"),
-		DriveLink: strings.Join(links, "\n"),
+		DriveLink: strings.Join(links, " "),
 	}
 
 	if err := appendToSheet(sheetsService, spreadsheetId, parsedData); err != nil {
