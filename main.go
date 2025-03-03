@@ -353,7 +353,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 
 	moscowOffset := int((3 * time.Hour).Seconds())
 	moscowTime := time.Unix(int64(message.Date), 0).UTC().Add(time.Duration(moscowOffset) * time.Second)
-	dateFormatted := moscowTime.Format("02.01.2006") // Изменен формат даты на точки вместо слешей
+	dateFormatted := moscowTime.Format("02.01.2006")
 
 	username := getFullName(message.From)
 
@@ -380,7 +380,7 @@ func handlePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsS
 	defer resp.Body.Close()
 
 	sanitizedAddress := sanitizeFileName(address)
-	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, dateFormatted)
+	fileName := fmt.Sprintf("%s_%s.jpg", sanitizedAddress, sanitizedAddress)
 
 	tmpFile, err := os.CreateTemp("", "receipt_*_"+fileName)
 	if err != nil {
@@ -594,7 +594,12 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 	}
 	defer resp.Body.Close()
 
-	fileName := sanitizeFileName(fmt.Sprintf("%s_%s.jpg", address, time.Now()))
+	moscowOffset := int((3 * time.Hour).Seconds())
+	moscowTime := time.Unix(int64(message.Date), 0).UTC().Add(time.Duration(moscowOffset) * time.Second)
+	sanitizedAddress := sanitizeFileName(address)
+	dateFormatted := moscowTime.Format("02.01.2006")
+
+	fileName := sanitizeFileName(fmt.Sprintf("%s_%s_%s.jpg", sanitizedAddress, dateFormatted, amount))
 	tmpFile, err := os.CreateTemp("", fileName)
 	if err != nil {
 		log.Printf("Ошибка создания временного файла: %v", err)
