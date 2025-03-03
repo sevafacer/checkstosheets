@@ -234,104 +234,59 @@ func parseMessage(message string) (address string, amount string, comment string
 		return "", "", "", errors.New("пустое сообщение")
 	}
 
-	// Normalize line breaks and spaces
-	message = strings.ReplaceAll(message, "\r\n", "\n")
-	message = regexp.MustCompile(`\s+`).ReplaceAllString(message, " ")
-
-	// Create maps to store found values
-	foundFields := make(map[string][]string)
-	for field := range fieldKeywords {
-		foundFields[field] = []string{}
-	}
-
-	// Try parsing with format 1 and 2 (line by line with or without keywords)
 	lines := strings.Split(message, "\n")
+	var addr, amt, comm []string
 
-	// Track if we're in the format without keywords (just values on separate lines)
-	simpleFormat := len(lines) >= 2 && !containsAnyKeyword(lines[0]) && !containsAnyKeyword(lines[1])
-
-	if simpleFormat {
-		// Format 2: values without keywords on separate lines
-		if len(lines) >= 1 && lines[0] != "" {
-			foundFields["address"] = append(foundFields["address"], strings.TrimSpace(lines[0]))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
 		}
-		if len(lines) >= 2 && lines[1] != "" {
-			foundFields["amount"] = append(foundFields["amount"], cleanAmount(strings.TrimSpace(lines[1])))
-		}
-		if len(lines) >= 3 && lines[2] != "" {
-			foundFields["comment"] = append(foundFields["comment"], strings.TrimSpace(lines[2]))
-		}
-	} else {
-		// Try format 1 (with keywords) and format 3 (inline with keywords)
-		parseWithKeywords(message, foundFields)
-	}
 
-	// Validate required fields
-	if len(foundFields["address"]) == 0 || len(foundFields["amount"]) == 0 {
-		return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
-	}
+		found := false
 
-	return strings.Join(foundFields["address"], " "),
-		strings.Join(foundFields["amount"], " "),
-		strings.Join(foundFields["comment"], " "),
-		nil
-}
+		for field, keywords := range fieldKeywords {
+			for _, keyword := range keywords {
+				patterns := []string{
+					fmt.Sprintf(`(?i)(%s\s*[:=-])\s*(.+)`, regexp.QuoteMeta(keyword)),
+					fmt.Sprintf(`(?i)^%s\s+(.+)`, regexp.QuoteMeta(keyword)),
+				}
 
-func containsAnyKeyword(line string) bool {
-	line = strings.ToLower(line)
-	for _, keywords := range fieldKeywords {
-		for _, keyword := range keywords {
-			if strings.Contains(line, strings.ToLower(keyword)) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func parseWithKeywords(message string, foundFields map[string][]string) {
-	// Create combined patterns for searching
-	for field, keywords := range fieldKeywords {
-		for _, keyword := range keywords {
-			// Pattern for "keyword: value" or "keyword - value" or "keyword = value"
-			pattern1 := fmt.Sprintf(`(?i)%s\s*[:=-]\s*([^:=]+?)(?=\s+(?:%s)|$)`,
-				regexp.QuoteMeta(keyword),
-				buildKeywordPattern())
-
-			// Pattern for "keyword value"
-			pattern2 := fmt.Sprintf(`(?i)(?:^|\s)%s\s+([^:=]+?)(?=\s+(?:%s)|$)`,
-				regexp.QuoteMeta(keyword),
-				buildKeywordPattern())
-
-			// Try both patterns
-			for _, pattern := range []string{pattern1, pattern2} {
-				re := regexp.MustCompile(pattern)
-				matches := re.FindAllStringSubmatch(message, -1)
-
-				for _, match := range matches {
-					if len(match) > 1 {
-						value := strings.TrimSpace(match[1])
+				for _, pattern := range patterns {
+					re := regexp.MustCompile(pattern)
+					matches := re.FindStringSubmatch(line)
+					if len(matches) > 0 {
+						value := strings.TrimSpace(matches[len(matches)-1])
 						if value != "" {
-							if field == "amount" {
+							switch field {
+							case "address":
+								addr = append(addr, value)
+							case "amount":
 								value = cleanAmount(value)
+								amt = append(amt, value)
+							case "comment":
+								comm = append(comm, value)
 							}
-							foundFields[field] = append(foundFields[field], value)
+							found = true
+							break
 						}
 					}
 				}
+				if found {
+					break
+				}
+			}
+			if found {
+				break
 			}
 		}
 	}
-}
 
-func buildKeywordPattern() string {
-	var allKeywords []string
-	for _, keywords := range fieldKeywords {
-		for _, keyword := range keywords {
-			allKeywords = append(allKeywords, regexp.QuoteMeta(keyword))
-		}
+	if len(addr) == 0 || len(amt) == 0 {
+		return "", "", "", errors.New("не удалось найти обязательные поля: адрес и сумма")
 	}
-	return strings.Join(allKeywords, "|")
+
+	return strings.Join(addr, " "), strings.Join(amt, " "), strings.Join(comm, " "), nil
 }
 
 func cleanAmount(amount string) string {
