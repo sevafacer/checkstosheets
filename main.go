@@ -39,7 +39,7 @@ const (
 	sheetUpdateRange   = "'Чеки'!B%d:G%d"
 	sheetFormatRange   = "'Чеки'!B%d:G%d"
 	sheetIDPropID      = 1051413829
-	mediaGroupCacheTTL = 1 * time.Minute
+	mediaGroupCacheTTL = 3 * time.Minute
 )
 
 var fieldKeywords = map[string][]string{
@@ -82,15 +82,17 @@ type TokenInfo struct {
 }
 
 type MediaGroupData struct {
-	Files       map[string]bool
-	Caption     string
-	Address     string
-	Amount      string
-	Comment     string
-	LastUpdated time.Time
-	UserID      int64
-	ChatID      int64
-	Username    string
+	Files           map[string]bool
+	Caption         string
+	Address         string
+	Amount          string
+	Comment         string
+	LastUpdated     time.Time
+	UserID          int64
+	ChatID          int64
+	Username        string
+	ExpectedFiles   int
+	ReceivedUpdates int
 }
 
 type FileTask struct {
@@ -156,6 +158,7 @@ func loadEnvVars() (telegramToken string, spreadsheetId string, driveFolderId st
 func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 	tokenMutex.Lock()
 	defer tokenMutex.Unlock()
+
 	token, err := loadTokenFromEnv()
 	if err == nil {
 		if time.Until(token.Expiry) < tokenRefreshWindow {
@@ -238,8 +241,8 @@ func startOAuthServer(errCh chan<- error) *http.Server {
 
 	return server
 }
-
 func saveTokenToEnv(token *oauth2.Token) error {
+	log.Println("Начало сохранения OAuth токена в переменные окружения...") // Добавлено логирование начала сохранения
 	if token == nil {
 		return fmt.Errorf("попытка сохранить пустой токен")
 	}
@@ -264,22 +267,32 @@ func saveTokenToEnv(token *oauth2.Token) error {
 	}
 
 	encodedToken := base64.StdEncoding.EncodeToString(tokenJSON)
-	return os.Setenv("GOOGLE_OAUTH_TOKEN", encodedToken)
+	err = os.Setenv("GOOGLE_OAUTH_TOKEN", encodedToken)
+	if err != nil {
+		log.Printf("Ошибка при сохранении токена в переменные окружения: %v", err) // Добавлено логирование ошибки Setenv
+		return err
+	}
+	log.Println("OAuth токен успешно сохранен в переменные окружения.") // Добавлено логирование успеха сохранения
+	return nil
 }
 
 func loadTokenFromEnv() (*oauth2.Token, error) {
+	log.Println("Попытка загрузки OAuth токена из переменных окружения...") // Добавлено логирование попытки загрузки
 	tokenStr := os.Getenv("GOOGLE_OAUTH_TOKEN")
 	if tokenStr == "" {
+		log.Println("Токен не найден в переменных окружения.") //  Логирование, если токен не найден
 		return nil, fmt.Errorf("токен не найден в переменных окружения")
 	}
 
 	tokenJSON, err := base64.StdEncoding.DecodeString(tokenStr)
 	if err != nil {
+		log.Printf("Ошибка декодирования токена: %v", err) // Логирование ошибки декодирования
 		return nil, fmt.Errorf("ошибка декодирования токена: %v", err)
 	}
 
 	var tokenInfo TokenInfo
 	if err := json.Unmarshal(tokenJSON, &tokenInfo); err != nil {
+		log.Printf("Ошибка анмаршалинга токена: %v", err) // Логирование ошибки анмаршалинга
 		return nil, fmt.Errorf("ошибка анмаршалинга токена: %v", err)
 	}
 
@@ -289,7 +302,7 @@ func loadTokenFromEnv() (*oauth2.Token, error) {
 		RefreshToken: tokenInfo.RefreshToken,
 		Expiry:       tokenInfo.Expiry,
 	}
-
+	log.Printf("OAuth токен успешно загружен из переменных окружения. Срок действия: %v", token.Expiry) // Логирование успешной загрузки и срока действия
 	return token, nil
 }
 
@@ -548,9 +561,7 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 	}
 
 	bestPhoto := message.Photo[len(message.Photo)-1]
-
 	log.Printf("handleMediaGroupMessage: Получено сообщение. Количество фото в message.Photo: %d, MediaGroupID: %s, FileID текущего фото: %s", len(message.Photo), message.MediaGroupID, bestPhoto.FileID)
-	log.Printf("handleMediaGroupMessage: Получено сообщение. Количество фото в message.Photo: %d, MediaGroupID: %s", len(message.Photo), message.MediaGroupID)
 
 	moscowOffset := int((3 * time.Hour).Seconds())
 	moscowTime := time.Unix(int64(message.Date), 0).UTC().Add(time.Duration(moscowOffset) * time.Second)
@@ -558,53 +569,62 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 
 	if message.MediaGroupID != "" {
 		mediaGroupCacheMu.Lock()
+		defer mediaGroupCacheMu.Unlock() // Важно освободить мьютекс через defer
 
-		if _, exists := mediaGroupCache[message.MediaGroupID]; !exists {
-			caption := message.Caption
+		mediaGroupID := message.MediaGroupID // Для удобства объявим локальную переменную
+
+		groupData, exists := mediaGroupCache[mediaGroupID]
+		if !exists {
+			var caption string
+			caption = message.Caption
 
 			var address, amount, commentText string
 			if caption != "" {
 				var parseErr error
 				address, amount, commentText, parseErr = parseMessage(caption)
 				if parseErr != nil {
-					mediaGroupCacheMu.Unlock()
 					reply := tgbotapi.NewMessage(message.Chat.ID, "Не удалось распознать подпись к фото. Проверьте формат данных.")
 					bot.Send(reply)
 					return
 				}
 			}
 
-			mediaGroupCache[message.MediaGroupID] = &MediaGroupData{
-				Files:       make(map[string]bool),
-				Caption:     caption,
-				Address:     address,
-				Amount:      amount,
-				Comment:     commentText,
-				LastUpdated: time.Now(),
-				UserID:      message.From.ID,
-				ChatID:      message.Chat.ID,
-				Username:    getFullName(message.From),
+			mediaGroupCache[mediaGroupID] = &MediaGroupData{
+				Files:           make(map[string]bool),
+				Caption:         caption,
+				Address:         address,
+				Amount:          amount,
+				Comment:         commentText,
+				LastUpdated:     time.Now(),
+				UserID:          message.From.ID,
+				ChatID:          message.Chat.ID,
+				Username:        getFullName(message.From),
+				ExpectedFiles:   0,
+				ReceivedUpdates: 0,
 			}
+		}
+		groupData = mediaGroupCache[mediaGroupID]
 
-			go func(mediaGroupID string) {
-				time.Sleep(mediaGroupCacheTTL)
-				mediaGroupExpiryCh <- mediaGroupID
-			}(message.MediaGroupID)
+		if groupData.ReceivedUpdates == 0 {
+			groupData.ExpectedFiles = len(message.Photo)
+		}
+		groupData.ReceivedUpdates++
+
+		if _, processed := groupData.Files[bestPhoto.FileID]; !processed {
+			groupData.Files[bestPhoto.FileID] = false
+			groupData.LastUpdated = time.Now()
 		}
 
-		if _, processed := mediaGroupCache[message.MediaGroupID].Files[bestPhoto.FileID]; !processed {
-			mediaGroupCache[message.MediaGroupID].Files[bestPhoto.FileID] = false
-			mediaGroupCache[message.MediaGroupID].LastUpdated = time.Now()
+		log.Printf("handleMediaGroupMessage: Файл FileID: %s добавлен в кэш медиагруппы %s. Текущий размер кэша медиагруппы: %d, Ожидается файлов: %d, Получено обновлений: %d", bestPhoto.FileID, mediaGroupID, len(groupData.Files), groupData.ExpectedFiles, groupData.ReceivedUpdates)
+
+		if (groupData.ExpectedFiles > 0 && len(groupData.Files) >= groupData.ExpectedFiles) || time.Since(groupData.LastUpdated) > mediaGroupCacheTTL {
+			log.Printf("processMediaGroup: Запуск обработки медиагруппы %s. Файлов в кэше: %d, Ожидалось файлов: %d, Получено обновлений: %d, Время ожидания: %v", mediaGroupID, len(groupData.Files), groupData.ExpectedFiles, groupData.ReceivedUpdates, time.Since(groupData.LastUpdated))
+			go processMediaGroup(bot, mediaGroupID, sheetsService, spreadsheetId, driveService, parentFolderId, adminID)
+			delete(mediaGroupCache, mediaGroupID)
+		} else {
+			log.Printf("handleMediaGroupMessage: Медиагруппа %s еще не готова к обработке. Файлов в кэше: %d, Ожидается файлов: %d, Получено обновлений: %d, Время ожидания: %v", mediaGroupID, len(groupData.Files), groupData.ExpectedFiles, groupData.ReceivedUpdates, time.Since(groupData.LastUpdated))
+			mediaGroupCache[mediaGroupID] = groupData
 		}
-
-		log.Printf("handleMediaGroupMessage: Файл FileID: %s добавлен в кэш медиагруппы %s. Текущий размер кэша медиагруппы: %d", bestPhoto.FileID, message.MediaGroupID, len(mediaGroupCache[message.MediaGroupID].Files))
-
-		mediaGroupCacheMu.Unlock()
-
-		if message.Caption != "" || len(mediaGroupCache[message.MediaGroupID].Files) == 1 {
-			go processMediaGroup(bot, message.MediaGroupID, sheetsService, spreadsheetId, driveService, parentFolderId, adminID)
-		}
-
 		return
 	}
 
