@@ -48,6 +48,8 @@ var fieldKeywords = map[string][]string{
 	"comment": {"комментарий", "коммент", "прим", "примечание", "дополнение", "заметка"},
 }
 
+var tokenMutex sync.Mutex
+
 var (
 	oauthConfig *oauth2.Config
 	oauthState  = "state-token"
@@ -152,6 +154,8 @@ func loadEnvVars() (telegramToken string, spreadsheetId string, driveFolderId st
 }
 
 func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
+	tokenMutex.Lock()
+	defer tokenMutex.Unlock()
 	token, err := loadTokenFromEnv()
 	if err == nil {
 		if time.Until(token.Expiry) < tokenRefreshWindow {
@@ -546,6 +550,7 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 	bestPhoto := message.Photo[len(message.Photo)-1]
 
 	log.Printf("handleMediaGroupMessage: Получено сообщение. Количество фото в message.Photo: %d, MediaGroupID: %s, FileID текущего фото: %s", len(message.Photo), message.MediaGroupID, bestPhoto.FileID)
+	log.Printf("handleMediaGroupMessage: Получено сообщение. Количество фото в message.Photo: %d, MediaGroupID: %s", len(message.Photo), message.MediaGroupID)
 
 	moscowOffset := int((3 * time.Hour).Seconds())
 	moscowTime := time.Unix(int64(message.Date), 0).UTC().Add(time.Duration(moscowOffset) * time.Second)
@@ -1025,6 +1030,20 @@ func main() {
 		},
 		Endpoint: google.Endpoint,
 	}
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			log.Println("Запуск принудительного обновления OAuth токена...")
+			_, err := getOAuthClient(oauthConfig)
+			if err != nil {
+				log.Printf("Ошибка принудительного обновления токена: %v", err)
+			} else {
+				log.Println("Принудительное обновление токена успешно.")
+			}
+		}
+	}()
 
 	client, err := getOAuthClient(oauthConfig)
 	if err != nil {
