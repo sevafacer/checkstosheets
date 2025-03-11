@@ -3,6 +3,7 @@ module checkbot
 go 1.23.2
 
 require (
+	github.com/avast/retry-go v3.0.0+incompatible
 	github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1
 	golang.org/x/oauth2 v0.23.0
 	google.golang.org/api v0.200.0
@@ -20,6 +21,7 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.4 // indirect
 	github.com/googleapis/gax-go/v2 v2.13.0 // indirect
+	github.com/stretchr/testify v1.10.0 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.54.0 // indirect
 	go.opentelemetry.io/otel v1.29.0 // indirect
