@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -785,64 +787,108 @@ func sanitizeFileName(name string) string {
 
 func main() {
 	telegramToken, spreadsheetId, driveFolderId, adminID, googleClientID, googleClientSecret, webhookURL := loadEnvVars()
-
 	oauthConfig = &oauth2.Config{
 		ClientID:     googleClientID,
 		ClientSecret: googleClientSecret,
-		RedirectURL:  webhookURL,
+		RedirectURL:  "https://checkstosheets-production.up.railway.app/",
 		Scopes: []string{
 			"https://www.googleapis.com/auth/spreadsheets",
 			"https://www.googleapis.com/auth/drive.file",
 		},
 		Endpoint: google.Endpoint,
 	}
-
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			_, err := getOAuthClient(oauthConfig)
+			if err != nil {
+			}
+		}
+	}()
 	client, err := getOAuthClient(oauthConfig)
 	if err != nil {
 		log.Fatalf("OAuth клиент не получен: %v", err)
 	}
-
 	sheetsService, err := sheets.NewService(context.Background(), option.WithHTTPClient(client))
 	if err != nil {
 		log.Fatalf("Sheets сервис не создан: %v", err)
 	}
-
 	driveService, err := drive.NewService(context.Background(), option.WithHTTPClient(client))
 	if err != nil {
 		log.Fatalf("Drive сервис не создан: %v", err)
 	}
-
 	bot, err := tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		log.Panic(err)
 	}
-
-	webhook, _ := tgbotapi.NewWebhook(webhookURL)
-	_, err = bot.Request(webhook)
+	bot.Debug = true
+	parsedWebhookURL, err := url.Parse(webhookURL)
 	if err != nil {
-		log.Fatalf("Ошибка настройки webhook: %v", err)
+		log.Fatalf("Неверный формат WEBHOOK_URL: %v", err)
 	}
-
+	webhookConfig := tgbotapi.WebhookConfig{URL: parsedWebhookURL, MaxConnections: 40}
+	_, err = bot.Request(webhookConfig)
+	if err != nil {
+		log.Fatalf("Webhook не установлен: %v", err)
+	}
+	keepAlive(webhookURL)
+	startMediaGroupCacheCleaner()
+	startWorkers(numWorkers, driveService, driveFolderId)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		bytes, _ := io.ReadAll(r.Body)
-		var update tgbotapi.Update
-		json.Unmarshal(bytes, &update)
-
-		if update.Message != nil {
-			if update.Message.MediaGroupID != "" || len(update.Message.Photo) > 0 {
-				go handleMediaGroupMessage(bot, update.Message, sheetsService, spreadsheetId, driveService, driveFolderId, adminID)
+		if r.Method == "POST" {
+			bytes, err := ioutil.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
 			}
+			var update tgbotapi.Update
+			err = json.Unmarshal(bytes, &update)
+			if err != nil {
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
+			}
+			if update.Message != nil {
+				if update.Message.IsCommand() {
+					switch update.Message.Command() {
+					case "start", "help":
+						helpText := `Привет! Я бот для отслеживания чеков.
+Пришли фотографию чека с подписью:
+Адрес: [адрес]
+Сумма: [сумма]
+Комментарий: [комментарий (опционально)]`
+						bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, helpText))
+					}
+				} else if update.Message.Photo != nil || update.Message.MediaGroupID != "" {
+					semaphore <- struct{}{}
+					wg.Add(1)
+					go func(m *tgbotapi.Message) {
+						defer wg.Done()
+						handleMediaGroupMessage(bot, m, sheetsService, spreadsheetId, driveService, driveFolderId, adminID)
+						<-semaphore
+					}(update.Message)
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+		} else {
+			http.Error(w, "Unsupported method", http.StatusMethodNotAllowed)
 		}
 	})
-
-	server := &http.Server{Addr: ":" + os.Getenv("PORT")}
-	go server.ListenAndServe()
-
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	server := &http.Server{Addr: ":" + port}
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP сервер не запущен: %v", err)
+		}
+	}()
 	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	server.Shutdown(ctx)
+	_ = server.Shutdown(ctx)
+	wg.Wait()
 }
