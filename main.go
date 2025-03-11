@@ -29,12 +29,9 @@ import (
 	"google.golang.org/api/sheets/v4"
 )
 
-// ========================
-// Константы и глобальные переменные 🚀
-// ========================
 const (
 	maxRetries           = 3
-	retryDelay           = 2 // базовая задержка между повторами (сек)
+	retryDelay           = 2
 	tokenRefreshWindow   = 5 * time.Minute
 	mediaGroupCacheTTL   = 3 * time.Minute
 	numWorkers           = 50
@@ -46,43 +43,25 @@ const (
 )
 
 var (
-	// Ключевые слова для распознавания полей из подписи (адрес, сумма, комментарий)
 	fieldKeywords = map[string][]string{
 		"address": {"адрес", "объект", "квартира", "школа", "дом", "улица", "место", "локация"},
 		"amount":  {"сумма", "стоимость", "оплата", "платёж", "цена"},
 		"comment": {"комментарий", "коммент", "прим", "примечание", "дополнение", "заметка"},
 	}
 
-	// Мьютексы и каналы для синхронизации
 	tokenMutex              sync.Mutex
 	mediaGroupCacheMu       sync.Mutex
 	mediaGroupCleanupTicker *time.Ticker
 
-	// OAuth-конфигурация, которую заполняем в main()
 	oauthConfig *oauth2.Config
 
-	// Состояние OAuth
 	oauthState = "state-token"
 	authCodeCh = make(chan string)
 
-	// Кэш для медиагрупп (используется для объединения фото из группы)
 	mediaGroupCache = make(map[string]*MediaGroupData)
-
-	// Общие каналы для обработки заданий, если потребуется расширение
-	taskQueue   = make(chan FileTask, 100)
-	resultsChan = make(chan FileResult, 100)
-
-	// Для ограничения количества одновременных горутин (если нужно)
-	semaphore = make(chan struct{}, 100)
-	wg        sync.WaitGroup
+	wg              sync.WaitGroup
 )
 
-//
-// ========================
-// Структуры данных 📦
-// ========================
-
-// ParsedData хранит данные, которые будут записаны в Google Sheets
 type ParsedData struct {
 	Address   string
 	Amount    string
@@ -92,7 +71,6 @@ type ParsedData struct {
 	DriveLink string
 }
 
-// TokenInfo для сохранения токена OAuth в виде JSON
 type TokenInfo struct {
 	AccessToken  string    `json:"access_token"`
 	TokenType    string    `json:"token_type"`
@@ -100,22 +78,20 @@ type TokenInfo struct {
 	Expiry       time.Time `json:"expiry"`
 }
 
-// MediaGroupData – данные, связанные с группой медиа (фото)
 type MediaGroupData struct {
-	Files            map[string]*tgbotapi.PhotoSize // Кэш фото (ключ – FileID)
-	Caption          string                         // Подпись к первому фото
+	Files            map[string]*tgbotapi.PhotoSize
+	Caption          string
 	Address          string
 	Amount           string
 	Comment          string
-	FirstMessageTime time.Time // Время получения первого сообщения группы
-	LastUpdated      time.Time // Время последнего обновления группы
+	FirstMessageTime time.Time
+	LastUpdated      time.Time
 	UserID           int64
 	ChatID           int64
 	Username         string
-	IsProcessing     bool // Флаг, что группа уже обрабатывается
+	IsProcessing     bool
 }
 
-// FileTask и FileResult можно использовать для расширенной обработки файлов (если понадобится)
 type FileTask struct {
 	FileID         string
 	FileURL        string
@@ -132,17 +108,11 @@ type FileResult struct {
 	Error     error
 }
 
-// Для парсинга подписи по регулярке
 type fieldMatch struct {
 	field string
 	start int
 	end   int
 }
-
-//
-// ========================
-// Функции для загрузки настроек из переменных окружения 🔧
-// ========================
 
 func loadEnvVars() (string, string, string, int64, string, string, string) {
 	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
@@ -177,18 +147,11 @@ func loadEnvVars() (string, string, string, int64, string, string, string) {
 	return telegramToken, spreadsheetId, driveFolderId, adminID, googleClientID, googleClientSecret, webhookURL
 }
 
-//
-// ========================
-// Функции OAuth и работы с токеном 🔑
-// ========================
-
-// getOAuthClient возвращает HTTP клиент с актуальным OAuth токеном
 func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 	tokenMutex.Lock()
 	token, err := loadTokenFromEnv()
 	tokenMutex.Unlock()
 	if err == nil {
-		// Если токен скоро истечёт, пробуем обновить его
 		if time.Until(token.Expiry) < tokenRefreshWindow && token.RefreshToken != "" {
 			newToken, err := refreshToken(config, token)
 			if err == nil {
@@ -200,7 +163,6 @@ func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 		}
 	}
 
-	// Запуск локального сервера для OAuth авторизации
 	serverErrCh := make(chan error, 1)
 	server := startOAuthServer(serverErrCh)
 	defer func() {
@@ -227,7 +189,6 @@ func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 	}
 }
 
-// startOAuthServer запускает локальный HTTP сервер для получения кода авторизации
 func startOAuthServer(errCh chan<- error) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -255,7 +216,6 @@ func startOAuthServer(errCh chan<- error) *http.Server {
 	return server
 }
 
-// saveTokenToEnv сохраняет токен в переменную окружения (в base64)
 func saveTokenToEnv(token *oauth2.Token) error {
 	if token == nil {
 		return errors.New("пустой токен")
@@ -266,7 +226,6 @@ func saveTokenToEnv(token *oauth2.Token) error {
 		RefreshToken: token.RefreshToken,
 		Expiry:       token.Expiry,
 	}
-	// Если новый токен не содержит RefreshToken – сохраняем старый, если он есть
 	if token.RefreshToken == "" && os.Getenv("GOOGLE_OAUTH_TOKEN") != "" {
 		oldToken, err := loadTokenFromEnv()
 		if err == nil && oldToken.RefreshToken != "" {
@@ -281,7 +240,6 @@ func saveTokenToEnv(token *oauth2.Token) error {
 	return os.Setenv("GOOGLE_OAUTH_TOKEN", encodedToken)
 }
 
-// loadTokenFromEnv загружает токен из переменной окружения
 func loadTokenFromEnv() (*oauth2.Token, error) {
 	tokenStr := os.Getenv("GOOGLE_OAUTH_TOKEN")
 	if tokenStr == "" {
@@ -303,7 +261,6 @@ func loadTokenFromEnv() (*oauth2.Token, error) {
 	}, nil
 }
 
-// refreshToken пытается обновить OAuth токен с несколькими повторами
 func refreshToken(config *oauth2.Config, token *oauth2.Token) (*oauth2.Token, error) {
 	var newToken *oauth2.Token
 	var err error
@@ -320,12 +277,6 @@ func refreshToken(config *oauth2.Config, token *oauth2.Token) (*oauth2.Token, er
 	return nil, fmt.Errorf("не удалось обновить токен после %d попыток: %v", maxRetries, err)
 }
 
-//
-// ========================
-// Функции для работы с Google Drive и Sheets 📁📊
-// ========================
-
-// ensureObjectFolder ищет или создаёт папку на Google Drive для заданного объекта (например, адрес)
 func ensureObjectFolder(service *drive.Service, parentFolderId, objectName string) (string, error) {
 	sanitized := strings.TrimSpace(objectName)
 	if sanitized == "" {
@@ -351,7 +302,6 @@ func ensureObjectFolder(service *drive.Service, parentFolderId, objectName strin
 		return fileList.Files[0].Id, nil
 	}
 
-	// Если папка не найдена, создаём новую
 	folder := &drive.File{
 		Name:     sanitized,
 		Parents:  []string{parentFolderId},
@@ -372,31 +322,6 @@ func ensureObjectFolder(service *drive.Service, parentFolderId, objectName strin
 	return created.Id, nil
 }
 
-// uploadFileToDrive загружает локальный файл в Google Drive
-func uploadFileToDrive(service *drive.Service, filePath, fileName, folderId string) (string, error) {
-	var lastErr error
-	for i := 0; i < maxRetries; i++ {
-		f, err := os.Open(filePath)
-		if err != nil {
-			return "", fmt.Errorf("ошибка открытия файла: %v", err)
-		}
-		defer f.Close()
-		driveFile := &drive.File{
-			Name:    fileName,
-			Parents: []string{folderId},
-		}
-		res, err := service.Files.Create(driveFile).Media(f).Fields("webViewLink").Do()
-		if err == nil {
-			return res.WebViewLink, nil
-		}
-		lastErr = err
-		service, _ = refreshDriveService(service, err)
-		time.Sleep(time.Duration(retryDelay*(i+1)) * time.Second)
-	}
-	return "", fmt.Errorf("загрузка файла не удалась: %v", lastErr)
-}
-
-// refreshDriveService обновляет сервис Google Drive, если токен истёк
 func refreshDriveService(service *drive.Service, originalErr error) (*drive.Service, error) {
 	if strings.Contains(originalErr.Error(), "oauth2: token expired") {
 		newClient, err := getOAuthClient(oauthConfig)
@@ -412,13 +337,10 @@ func refreshDriveService(service *drive.Service, originalErr error) (*drive.Serv
 	return service, originalErr
 }
 
-// appendToSheet записывает данные в Google Sheets
 func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedData) error {
-	// Обратите внимание: для интерактивных ссылок мы используем пробел вместо запятой
 	values := []interface{}{data.Date, data.Username, data.Address, data.Amount, data.Comment, data.DriveLink}
 	vr := &sheets.ValueRange{Values: [][]interface{}{values}}
 
-	// Получаем текущие данные для определения последней строки
 	resp, err := service.Spreadsheets.Values.Get(spreadsheetId, sheetIDRange).Do()
 	if err != nil {
 		return fmt.Errorf("получение данных не удалось: %v", err)
@@ -433,7 +355,6 @@ func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedDat
 		return fmt.Errorf("обновление Sheets не удалось: %v", err)
 	}
 
-	// Можно добавить дополнительное форматирование ячеек, если требуется
 	formatRequest := sheets.BatchUpdateSpreadsheetRequest{
 		Requests: []*sheets.Request{
 			{
@@ -462,7 +383,6 @@ func appendToSheet(service *sheets.Service, spreadsheetId string, data ParsedDat
 	return err
 }
 
-// keepAlive отправляет периодические GET-запросы на webhookURL, чтобы не "засыпал" сервер
 func keepAlive(webhookURL string) {
 	ticker := time.NewTicker(10 * time.Minute)
 	go func() {
@@ -476,60 +396,43 @@ func keepAlive(webhookURL string) {
 	}()
 }
 
-//
-// ========================
-// Функции обработки сообщений Telegram 📲
-// ========================
-
-// handleSinglePhotoMessage обрабатывает сообщение с одним фото
 func handleSinglePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string) {
-	// Проверка наличия подписи
 	if message.Caption == "" {
 		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "❗️ Укажи адрес и сумму в подписи к фото в формате:\nАдрес: ...\nСумма: ..."))
 		return
 	}
 
-	// Парсим подпись
 	addr, amt, comm, err := parseMessage(message.Caption)
 	if err != nil {
 		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "❗️ Не удалось распознать подпись. Укажи адрес и сумму в формате:\nАдрес: ...\nСумма: ..."))
 		return
 	}
 
-	// Проверяем обязательные поля
 	if addr == "" || amt == "" {
 		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "❗️ Обязательно укажи адрес и сумму в подписи!"))
 		return
 	}
 
-	// Получаем фото наилучшего качества (последний в срезе)
 	bestPhoto := message.Photo[len(message.Photo)-1]
 
-	// Получаем прямую ссылку на файл
 	fileURL, err := bot.GetFileDirectURL(bestPhoto.FileID)
 	if err != nil {
 		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "❗️ Не удалось получить фото: "+err.Error()))
 		return
 	}
 
-	// Загружаем фото в Google Drive
 	fileID, err := uploadPhotoToDrive(driveService, fileURL, parentFolderId, fmt.Sprintf("check_%s", time.Now().Format("20060102_150405")))
 	if err != nil {
 		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "❗️ Не удалось загрузить фото в Google Drive: "+err.Error()))
 		return
 	}
 
-	// Формируем ссылку на файл
 	fileLink := fmt.Sprintf("https://drive.google.com/file/d/%s/view", fileID)
 
-	// Готовим данные для записи в таблицу
-	timestamp := time.Now().Format("02.01.2006 15:04:05")
-	username := getFullName(message.From)
-	row := []interface{}{timestamp, username, addr, amt, comm, fileLink}
-
-	// Записываем строку в Google Sheets
-	appendRange := "Чеки!A:F"
+	appendRange := "Чеки!B:G"
+	row := []interface{}{time.Now().Format("02.01.2006 15:04:05"), getFullName(message.From), addr, amt, comm, fileLink}
 	valueRange := &sheets.ValueRange{Values: [][]interface{}{row}}
+
 	_, err = sheetsService.Spreadsheets.Values.Append(spreadsheetId, appendRange, valueRange).
 		ValueInputOption("USER_ENTERED").
 		InsertDataOption("INSERT_ROWS").
@@ -539,29 +442,23 @@ func handleSinglePhotoMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, s
 		return
 	}
 
-	// Сообщаем об успехе
 	bot.Send(tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("✅ Чек успешно загружен!\nАдрес: %s\nСумма: %s", addr, amt)))
 }
 
-// handleMediaGroupMessage обрабатывает сообщения с группой фото (медиагруппа)
 func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
-	// Если фото отсутствуют – сообщаем и выходим
 	if len(message.Photo) == 0 {
 		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "❗️ Сообщение не содержит фотографий."))
 		return
 	}
 
-	// Если сообщение не относится к медиагруппе, обрабатываем как единичное фото
 	if message.MediaGroupID == "" {
 		handleSinglePhotoMessage(bot, message, sheetsService, spreadsheetId, driveService, parentFolderId)
 		return
 	}
 
-	// Работа с кэшем медиагруппы для объединения фото из одной группы
 	mediaGroupCacheMu.Lock()
 	groupData, exists := mediaGroupCache[message.MediaGroupID]
 	if !exists {
-		// Первое сообщение в группе – пытаемся распарсить подпись, если она есть
 		caption := message.Caption
 		var addr, amt, comm string
 		if caption != "" {
@@ -573,12 +470,11 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 				return
 			}
 			if addr == "" || amt == "" {
-				bot.Send(tgbotapi.NewMessage(message.Chat.ID, "❗️ Обязательно укажи адрес и сумму в подписи к первому фото группы!"))
+				bot.Send(tgbotapi.NewMessage(message.Chat.ID, "❗️ Обязательно укажи адрес и сумму в подписи к фотоальбому!"))
 				mediaGroupCacheMu.Unlock()
 				return
 			}
 		}
-		// Создаём новую запись для медиагруппы
 		groupData = &MediaGroupData{
 			Files:            make(map[string]*tgbotapi.PhotoSize),
 			Caption:          caption,
@@ -594,7 +490,6 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 		}
 		mediaGroupCache[message.MediaGroupID] = groupData
 	}
-	// Добавляем текущее фото в кэш (если ещё не добавлено)
 	bestPhoto := message.Photo[len(message.Photo)-1]
 	if _, ok := groupData.Files[bestPhoto.FileID]; !ok {
 		groupData.Files[bestPhoto.FileID] = &bestPhoto
@@ -602,10 +497,6 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 	}
 	mediaGroupID := message.MediaGroupID
 
-	// Проверяем условия для старта обработки группы:
-	// 1. Прошло не менее 1 сек с первого фото (даём время на приход остальных фото)
-	// 2. Группа ещё не в обработке
-	// 3. Либо собрано 10 фото, либо прошло более 2 сек
 	timeSinceFirst := time.Since(groupData.FirstMessageTime)
 	shouldProcess := false
 	if !groupData.IsProcessing && timeSinceFirst >= 1*time.Second &&
@@ -615,15 +506,12 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sh
 	}
 	mediaGroupCacheMu.Unlock()
 
-	// Если пора обрабатывать группу – запускаем отдельную горутину
 	if shouldProcess {
 		go processMediaGroupOptimized(bot, mediaGroupID, sheetsService, spreadsheetId, driveService, parentFolderId, adminID)
 	}
 }
 
-// processMediaGroupOptimized – обработка медиагруппы с параллельной загрузкой фото
 func processMediaGroupOptimized(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
-	// Немного ждём, чтобы убедиться, что все фото получены
 	time.Sleep(500 * time.Millisecond)
 
 	mediaGroupCacheMu.Lock()
@@ -632,14 +520,12 @@ func processMediaGroupOptimized(bot *tgbotapi.BotAPI, mediaGroupID string, sheet
 		mediaGroupCacheMu.Unlock()
 		return
 	}
-	// Создаём локальные копии необходимых данных
 	addr := groupData.Address
 	amt := groupData.Amount
 	comm := groupData.Comment
 	chatID := groupData.ChatID
 	username := groupData.Username
 
-	// Собираем фото в срез для сортировки по качеству (по убыванию площади)
 	var photos []*tgbotapi.PhotoSize
 	for _, photo := range groupData.Files {
 		photos = append(photos, photo)
@@ -649,46 +535,38 @@ func processMediaGroupOptimized(bot *tgbotapi.BotAPI, mediaGroupID string, sheet
 	})
 	mediaGroupCacheMu.Unlock()
 
-	// Если обязательные данные отсутствуют, уведомляем пользователя
 	if addr == "" || amt == "" {
 		bot.Send(tgbotapi.NewMessage(chatID, "❗️ Укажи адрес и сумму в подписи к первому фото группы!"))
 		return
 	}
 
-	// Находим или создаём папку для объекта (адрес) на Google Drive
 	folderID, err := ensureObjectFolder(driveService, parentFolderId, addr)
 	if err != nil {
 		bot.Send(tgbotapi.NewMessage(chatID, "❗️ Ошибка обработки объекта: "+err.Error()))
 		return
 	}
 
-	// Формируем базовое имя файла и формат даты
 	sanitized := sanitizeFileName(addr)
 	moscow := time.FixedZone("MSK", 3*3600)
 	dateFormatted := time.Now().In(moscow).Format("02.01.2006")
 
-	// Канал для сбора ссылок загруженных файлов
 	uploadResults := make(chan string, len(photos))
 	var uploadWg sync.WaitGroup
 	uploadSemaphore := make(chan struct{}, maxConcurrentUploads)
 
-	// Параллельная загрузка каждого фото
 	for i, photo := range photos {
 		uploadWg.Add(1)
 		go func(index int, p *tgbotapi.PhotoSize) {
 			defer uploadWg.Done()
-			uploadSemaphore <- struct{}{} // Захватываем слот
+			uploadSemaphore <- struct{}{}
 			defer func() { <-uploadSemaphore }()
 
-			// Получаем информацию о файле
 			fileInfo, err := bot.GetFile(tgbotapi.FileConfig{FileID: p.FileID})
 			if err != nil {
 				return
 			}
 			fileURL := fileInfo.Link(bot.Token)
-			// Формируем имя файла
 			fileName := sanitizeFileName(fmt.Sprintf("%s_%s_%02d_%s.jpg", sanitized, dateFormatted, index+1, amt))
-			// Загружаем файл (общая функция загрузки)
 			link, err := downloadAndUploadFile(fileURL, fileName, driveService, folderID)
 			if err != nil {
 				return
@@ -701,7 +579,6 @@ func processMediaGroupOptimized(bot *tgbotapi.BotAPI, mediaGroupID string, sheet
 		close(uploadResults)
 	}()
 
-	// Собираем все ссылки (для интерактивности ссылки разделяем пробелом)
 	var links []string
 	for link := range uploadResults {
 		links = append(links, link)
@@ -711,14 +588,12 @@ func processMediaGroupOptimized(bot *tgbotapi.BotAPI, mediaGroupID string, sheet
 		return
 	}
 
-	// Готовим данные для записи в таблицу
 	parsedData := ParsedData{
-		Address:  addr,
-		Amount:   amt,
-		Comment:  comm,
-		Username: username,
-		Date:     time.Now().In(moscow).Format("02/01/2006 15:04:05"),
-		// Используем пробел для разделения ссылок, чтобы они стали интерактивными
+		Address:   addr,
+		Amount:    amt,
+		Comment:   comm,
+		Username:  username,
+		Date:      time.Now().In(moscow).Format("02/01/2006 15:04:05"),
 		DriveLink: strings.Join(links, " "),
 	}
 	if err := appendToSheet(sheetsService, spreadsheetId, parsedData); err != nil {
@@ -726,16 +601,15 @@ func processMediaGroupOptimized(bot *tgbotapi.BotAPI, mediaGroupID string, sheet
 		return
 	}
 
-	// Удаляем обработанную медиагруппу из кэша
 	mediaGroupCacheMu.Lock()
 	delete(mediaGroupCache, mediaGroupID)
 	mediaGroupCacheMu.Unlock()
 
-	// Уведомляем пользователя об успешной обработке группы
-	bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Успешно обработано %d из %d фото.", len(links), len(photos))))
+	// Изменили сообщение об успешной загрузке для медиагруппы: выводим количество фото и повторяем адрес, сумму и комментарий
+	bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Чек успешно загружен!\nФото: %d/%d обработано\nАдрес: %s\nСумма: %s\nКомментарий: %s",
+		len(links), len(photos), addr, amt, comm)))
 }
 
-// downloadAndUploadFile скачивает файл по URL во временный файл и загружает его на Google Drive
 func downloadAndUploadFile(fileURL, fileName string, driveService *drive.Service, folderID string) (string, error) {
 	resp, err := http.Get(fileURL)
 	if err != nil {
@@ -777,13 +651,6 @@ func downloadAndUploadFile(fileURL, fileName string, driveService *drive.Service
 	return "", fmt.Errorf("❗️ Загрузка файла не удалась после %d попыток: %v", maxRetries, lastErr)
 }
 
-// notifyAdminAboutSheetError уведомляет администратора о критической ошибке записи в таблицу
-func notifyAdminAboutSheetError(bot *tgbotapi.BotAPI, adminID int64, err error, mediaGroupID string) {
-	msg := tgbotapi.NewMessage(adminID, fmt.Sprintf("⚠️ Ошибка Sheets для медиагруппы %s: %v", mediaGroupID, err))
-	_, _ = bot.Send(msg)
-}
-
-// getFullName возвращает полное имя пользователя (FirstName + LastName)
 func getFullName(user *tgbotapi.User) string {
 	if user.LastName != "" {
 		return fmt.Sprintf("%s %s", user.FirstName, user.LastName)
@@ -791,12 +658,6 @@ func getFullName(user *tgbotapi.User) string {
 	return user.FirstName
 }
 
-//
-// ========================
-// Функции для парсинга сообщений и очистки строк 🔍
-// ========================
-
-// removeLeadingKeyword удаляет ключевое слово из начала строки
 func removeLeadingKeyword(text string, keywords []string) string {
 	trimmed := strings.TrimSpace(text)
 	lower := strings.ToLower(trimmed)
@@ -808,7 +669,6 @@ func removeLeadingKeyword(text string, keywords []string) string {
 	return trimmed
 }
 
-// fallbackParse выполняет альтернативный разбор сообщения, если основной парсинг не сработал
 func fallbackParse(message string) (string, string, string, error) {
 	if strings.Contains(message, "\n") {
 		lines := strings.Split(message, "\n")
@@ -861,7 +721,6 @@ func fallbackParse(message string) (string, string, string, error) {
 	return addr, "", "", errors.New("сумма не найдена")
 }
 
-// parseMessage анализирует сообщение и возвращает адрес, сумму и комментарий
 func parseMessage(message string) (string, string, string, error) {
 	if strings.TrimSpace(message) == "" {
 		return "", "", "", errors.New("пустое сообщение")
@@ -905,14 +764,12 @@ func parseMessage(message string) (string, string, string, error) {
 	return fallbackParse(message)
 }
 
-// cleanAmount очищает строку с суммой от лишних символов и заменяет точку на запятую
 func cleanAmount(amount string) string {
 	re := regexp.MustCompile(`[^0-9.,]`)
 	cleaned := re.ReplaceAllString(amount, "")
 	return strings.ReplaceAll(cleaned, ".", ",")
 }
 
-// sanitizeFileName удаляет недопустимые символы из имени файла
 func sanitizeFileName(name string) string {
 	re := regexp.MustCompile(`[^а-яА-ЯёЁa-zA-Z0-9\s\.-]`)
 	sanitized := re.ReplaceAllString(name, "_")
@@ -922,14 +779,7 @@ func sanitizeFileName(name string) string {
 	return strings.Trim(sanitized, "_")
 }
 
-//
-// ========================
-// HTTP обработчик для Webhook и старт бота 🚀
-// ========================
-
-// setupHandler настраивает HTTP обработчик для приема обновлений от Telegram
 func setupHandler(bot *tgbotapi.BotAPI, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
-	// Инициализируем очистку устаревших медиагрупп
 	initMediaGroupHandler()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -946,26 +796,39 @@ func setupHandler(bot *tgbotapi.BotAPI, sheetsService *sheets.Service, spreadshe
 				return
 			}
 			if update.Message != nil {
-				// Обработка команд (приветствие и помощь)
 				if update.Message.IsCommand() {
 					switch update.Message.Command() {
 					case "start", "help":
-						helpText := `👋 Привет! Я бот для отслеживания чеков!
-						
-Отправь мне фотографию чека с подписью, где:
-• **Адрес**: адрес объекта 🏠
-• **Сумма**: стоимость или оплата 💰
-• **Комментарий**: опционально, можно добавить заметку 😉
-						
-Ты можешь отправить как одиночное фото, так и группу фото (до 10 штук)! Подпись указывай только к первому фото группы.
-						
-Давай попробуем?`
+						helpText := "# 👋 Бот для отслеживания чеков!\n\n" +
+							"## Что умеет бот?\n" +
+							"Бот помогает добавлять информацию о чеках в Google-таблицу и отслеживать расходы. Вы можете отправить фото чека с подписью, указав:\n\n" +
+							"* **Адрес** - местоположение объекта 🏠\n" +
+							"* **Сумму** - стоимость покупки 💰\n" +
+							"* **Комментарий** (опционально) - пояснение или заметка 📝\n\n" +
+							"## Как отправить данные?\n" +
+							"У вас есть **3 удобных способа** ввода информации:\n\n" +
+							"### 1️⃣ С ключевыми словами, одной строкой\n" +
+							"```\n" +
+							"Адрес: Тимирязева 19, кв. 201 Сумма: 1002,70 Комментарий: Провода\n" +
+							"```\n\n" +
+							"### 2️⃣ С ключевыми словами и переносами строк\n" +
+							"```\n" +
+							"Адрес: ул. Пушкина, д. 20, кв. 51\n" +
+							"Сумма: 90,91\n" +
+							"Комментарий: За сантехнику\n" +
+							"```\n\n" +
+							"### 3️⃣ Без ключевых слов, с переносами строк\n" +
+							"```\n" +
+							"Тимирязева, 20, 201\n" +
+							"1002,7\n" +
+							"Провода\n" +
+							"```\n\n" +
+							"Давайте начнем работу с ботом! Отправьте фото чека с подписью 📸"
 						msg := tgbotapi.NewMessage(update.Message.Chat.ID, helpText)
 						msg.ParseMode = "Markdown"
 						bot.Send(msg)
 					}
 				} else if update.Message.Photo != nil {
-					// Если получено фото – обрабатываем в отдельной горутине
 					go handleMediaGroupMessage(bot, update.Message, sheetsService, spreadsheetId, driveService, parentFolderId, adminID)
 				}
 			}
@@ -976,7 +839,6 @@ func setupHandler(bot *tgbotapi.BotAPI, sheetsService *sheets.Service, spreadshe
 	})
 }
 
-// initMediaGroupHandler запускает периодическую очистку кэша медиагрупп
 func initMediaGroupHandler() {
 	mediaGroupCleanupTicker = time.NewTicker(1 * time.Minute)
 	go func() {
@@ -986,7 +848,6 @@ func initMediaGroupHandler() {
 	}()
 }
 
-// cleanupExpiredMediaGroups удаляет устаревшие данные медиагрупп
 func cleanupExpiredMediaGroups() {
 	mediaGroupCacheMu.Lock()
 	defer mediaGroupCacheMu.Unlock()
@@ -998,11 +859,7 @@ func cleanupExpiredMediaGroups() {
 	}
 }
 
-// ========================
-// Функция загрузки фото напрямую в Google Drive (для одиночных фото) 📸
-// ========================
 func uploadPhotoToDrive(driveService *drive.Service, fileURL, parentFolderId, filename string) (string, error) {
-	// Скачиваем файл по URL
 	resp, err := http.Get(fileURL)
 	if err != nil {
 		return "", err
@@ -1023,14 +880,9 @@ func uploadPhotoToDrive(driveService *drive.Service, fileURL, parentFolderId, fi
 	return file.Id, nil
 }
 
-// ========================
-// Главная функция main() – точка входа в программу 🚀
-// ========================
 func main() {
-	// Загружаем переменные окружения
 	telegramToken, spreadsheetId, driveFolderId, adminID, googleClientID, googleClientSecret, webhookURL := loadEnvVars()
 
-	// Настраиваем OAuth для Google API
 	oauthConfig = &oauth2.Config{
 		ClientID:     googleClientID,
 		ClientSecret: googleClientSecret,
@@ -1042,25 +894,21 @@ func main() {
 		Endpoint: google.Endpoint,
 	}
 
-	// Периодически обновляем OAuth клиент в отдельной горутине
 	go func() {
 		ticker := time.NewTicker(30 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
 			_, err := getOAuthClient(oauthConfig)
 			if err != nil {
-				// Можно логировать ошибку, если потребуется
 			}
 		}
 	}()
 
-	// Получаем HTTP клиент с актуальным OAuth токеном
 	client, err := getOAuthClient(oauthConfig)
 	if err != nil {
 		log.Fatalf("OAuth клиент не получен: %v", err)
 	}
 
-	// Инициализируем сервисы Google Sheets и Drive
 	sheetsService, err := sheets.NewService(context.Background(), option.WithHTTPClient(client))
 	if err != nil {
 		log.Fatalf("Sheets сервис не создан: %v", err)
@@ -1070,14 +918,12 @@ func main() {
 		log.Fatalf("Drive сервис не создан: %v", err)
 	}
 
-	// Создаём бота Telegram
 	bot, err := tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		log.Panic(err)
 	}
 	bot.Debug = true
 
-	// Настраиваем webhook для Telegram
 	parsedWebhookURL, err := url.Parse(webhookURL)
 	if err != nil {
 		log.Fatalf("Неверный формат WEBHOOK_URL: %v", err)
@@ -1088,13 +934,9 @@ func main() {
 		log.Fatalf("Webhook не установлен: %v", err)
 	}
 
-	// Запускаем функцию keepAlive, чтобы сервер не "засыпал"
 	keepAlive(webhookURL)
-
-	// Настраиваем HTTP обработчик для получения обновлений от Telegram
 	setupHandler(bot, sheetsService, spreadsheetId, driveService, driveFolderId, adminID)
 
-	// Запускаем HTTP сервер
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -1105,8 +947,6 @@ func main() {
 			log.Fatalf("HTTP сервер не запущен: %v", err)
 		}
 	}()
-
-	// Ждём сигнала завершения (Ctrl+C или SIGTERM)
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
