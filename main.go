@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -20,7 +19,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/avast/retry-go"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -76,17 +74,17 @@ type TokenInfo struct {
 }
 
 type MediaGroupData struct {
-	Files         map[string]string // file_id -> future link
-	Caption       string
-	Address       string
-	Amount        string
-	Comment       string
-	UserID        int64
-	ChatID        int64
-	Username      string
-	ExpiryTimer   *time.Timer
-	DriveFolderID string
-	mux           sync.Mutex
+	Files           map[string]bool
+	Caption         string
+	Address         string
+	Amount          string
+	Comment         string
+	LastUpdated     time.Time
+	UserID          int64
+	ChatID          int64
+	Username        string
+	ExpectedFiles   int
+	ReceivedUpdates int
 }
 
 type FileTask struct {
@@ -109,14 +107,6 @@ type fieldMatch struct {
 	field string
 	start int
 	end   int
-}
-
-func (mg *MediaGroupData) AddFile(fileID string) {
-	mg.mux.Lock()
-	defer mg.mux.Unlock()
-	if _, exists := mg.Files[fileID]; !exists {
-		mg.Files[fileID] = ""
-	}
 }
 
 func loadEnvVars() (string, string, string, int64, string, string, string) {
@@ -443,122 +433,198 @@ func worker(tasks <-chan FileTask, results chan<- FileResult, driveService *driv
 }
 
 func handleMediaGroupMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
-	mediaGroupCacheMu.Lock()
-	defer mediaGroupCacheMu.Unlock()
-
-	if message.MediaGroupID == "" {
+	if len(message.Photo) == 0 {
+		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "Сообщение не содержит фотографий."))
 		return
 	}
-
-	groupData, exists := mediaGroupCache[message.MediaGroupID]
-	if !exists {
-		groupData = &MediaGroupData{
-			Files: make(map[string]string),
-			ExpiryTimer: time.AfterFunc(3*time.Second, func() {
-				processMediaGroup(bot, message.MediaGroupID, sheetsService, spreadsheetId, driveService, parentFolderId, adminID)
-			}),
+	bestPhoto := message.Photo[len(message.Photo)-1]
+	moscowTime := time.Unix(int64(message.Date), 0).UTC().Add(3 * time.Hour)
+	dateFormatted := moscowTime.Format("02.01.2006")
+	if message.MediaGroupID != "" {
+		mediaGroupCacheMu.Lock()
+		groupData, exists := mediaGroupCache[message.MediaGroupID]
+		if !exists {
+			caption := message.Caption
+			var addr, amt, comm string
+			if caption != "" {
+				var err error
+				addr, amt, comm, err = parseMessage(caption)
+				if err != nil {
+					bot.Send(tgbotapi.NewMessage(message.Chat.ID, "Не удалось распознать подпись."))
+					mediaGroupCacheMu.Unlock()
+					return
+				}
+			}
+			groupData = &MediaGroupData{
+				Files:           make(map[string]bool),
+				Caption:         caption,
+				Address:         addr,
+				Amount:          amt,
+				Comment:         comm,
+				LastUpdated:     time.Now(),
+				UserID:          message.From.ID,
+				ChatID:          message.Chat.ID,
+				Username:        getFullName(message.From),
+				ExpectedFiles:   0,
+				ReceivedUpdates: 0,
+			}
+			mediaGroupCache[message.MediaGroupID] = groupData
 		}
-		mediaGroupCache[message.MediaGroupID] = groupData
-	} else {
-		groupData.ExpiryTimer.Reset(3 * time.Second)
-	}
-
-	// Process caption only once
-	if message.Caption != "" && groupData.Caption == "" {
-		addr, amt, comm, err := parseMessage(message.Caption)
-		if err == nil {
-			groupData.Address = addr
-			groupData.Amount = amt
-			groupData.Comment = comm
-			groupData.Username = getFullName(message.From)
-			groupData.UserID = message.From.ID
-			groupData.ChatID = message.Chat.ID
+		if groupData.ReceivedUpdates == 0 {
+			groupData.ExpectedFiles = len(message.Photo)
 		}
-	}
-
-	// Add all photos from message
-	for _, photo := range message.Photo {
-		groupData.AddFile(photo.FileID)
-	}
-}
-
-func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
-	mediaGroupCacheMu.Lock()
-	groupData, exists := mediaGroupCache[mediaGroupID]
-	if !exists {
+		groupData.ReceivedUpdates++
+		if _, ok := groupData.Files[bestPhoto.FileID]; !ok {
+			groupData.Files[bestPhoto.FileID] = false
+			groupData.LastUpdated = time.Now()
+		}
+		if (groupData.ExpectedFiles > 0 && len(groupData.Files) >= groupData.ExpectedFiles) || time.Since(groupData.LastUpdated) > mediaGroupCacheTTL {
+			go processMediaGroup(bot, message.MediaGroupID, sheetsService, spreadsheetId, driveService, parentFolderId, adminID)
+			delete(mediaGroupCache, message.MediaGroupID)
+		}
 		mediaGroupCacheMu.Unlock()
 		return
 	}
-	delete(mediaGroupCache, mediaGroupID)
-	mediaGroupCacheMu.Unlock()
-
-	// Create folder if needed
-	folderID, err := ensureObjectFolder(driveService, parentFolderId, groupData.Address)
+	caption := message.Caption
+	addr, amt, comm, err := parseMessage(caption)
 	if err != nil {
-		bot.Send(tgbotapi.NewMessage(groupData.ChatID, "Ошибка создания папки"))
+		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "Не удалось распознать подпись."))
 		return
 	}
-
-	// Parallel download and upload
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 5) // Limit concurrent uploads
-
-	groupData.mux.Lock()
-	defer groupData.mux.Unlock()
-
-	moscow := time.FixedZone("MSK", 3*3600)
-	dateFormatted := time.Now().In(moscow).Format("02.01.2006")
-	sanitized := sanitizeFileName(groupData.Address)
-
-	for fileID := range groupData.Files {
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func(fid string) {
-			defer func() {
-				<-sem
-				wg.Done()
-			}()
-
-			photoFile, err := bot.GetFile(tgbotapi.FileConfig{FileID: fid})
-			if err != nil {
-				return
-			}
-
-			fileURL := photoFile.Link(bot.Token)
-			link, err := downloadAndUploadFile(fileURL, sanitized, dateFormatted, groupData.Amount, driveService, folderID)
-			if err == nil {
-				groupData.Files[fid] = link
-			}
-		}(fileID)
+	if addr == "" {
+		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "Введите адрес объекта."))
+		return
 	}
+	if amt == "" {
+		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "Введите сумму."))
+		return
+	}
+	folderID, err := ensureObjectFolder(driveService, parentFolderId, addr)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "Ошибка обработки объекта."))
+		return
+	}
+	sanitized := sanitizeFileName(addr)
+	photoFile, err := bot.GetFile(tgbotapi.FileConfig{FileID: bestPhoto.FileID})
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "Ошибка загрузки файла."))
+		return
+	}
+	fileURL := photoFile.Link(bot.Token)
+	link, err := downloadAndUploadFile(fileURL, sanitized, dateFormatted, amt, driveService, folderID)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "Ошибка загрузки на Drive."))
+		return
+	}
+	moscow := time.FixedZone("MSK", 3*3600)
+	parsedData := ParsedData{
+		Address:   addr,
+		Amount:    amt,
+		Comment:   comm,
+		Username:  getFullName(message.From),
+		Date:      time.Now().In(moscow).Format("02/01/2006 15:04:05"),
+		DriveLink: link,
+	}
+	if err := appendToSheet(sheetsService, spreadsheetId, parsedData); err != nil {
+		bot.Send(tgbotapi.NewMessage(message.Chat.ID, "Ошибка записи данных."))
+		return
+	}
+	bot.Send(tgbotapi.NewMessage(message.Chat.ID, "Фотография обработана."))
+}
 
-	wg.Wait()
-
-	// Collect results
-	var links []string
-	for _, link := range groupData.Files {
-		if link != "" {
-			links = append(links, link)
+func processMediaGroup(bot *tgbotapi.BotAPI, mediaGroupID string, sheetsService *sheets.Service, spreadsheetId string, driveService *drive.Service, parentFolderId string, adminID int64) {
+	time.Sleep(1 * time.Second)
+	mediaGroupCacheMu.Lock()
+	groupData, exists := mediaGroupCache[mediaGroupID]
+	mediaGroupCacheMu.Unlock()
+	if !exists || len(groupData.Files) == 0 {
+		return
+	}
+	var unprocessed []string
+	for id, processed := range groupData.Files {
+		if !processed {
+			unprocessed = append(unprocessed, id)
 		}
 	}
-
-	// Update Google Sheets
+	if len(unprocessed) == 0 {
+		return
+	}
+	addr, amt, comm, chatID, username := groupData.Address, groupData.Amount, groupData.Comment, groupData.ChatID, groupData.Username
+	if addr == "" || amt == "" {
+		bot.Send(tgbotapi.NewMessage(chatID, "Введите адрес и сумму."))
+		return
+	}
+	folderID, err := ensureObjectFolder(driveService, parentFolderId, addr)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(chatID, "Ошибка обработки объекта."))
+		return
+	}
+	moscow := time.FixedZone("MSK", 3*3600)
+	dateFormatted := time.Now().In(moscow).Format("02.01.2006")
+	sanitized := sanitizeFileName(addr)
+	var tasks []FileTask
+	for i, fileID := range unprocessed {
+		photoFile, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
+		if err != nil {
+			continue
+		}
+		fileURL := photoFile.Link(bot.Token)
+		name := fmt.Sprintf("%s_%d", sanitized, i+1)
+		tasks = append(tasks, FileTask{
+			FileID:         fileID,
+			FileURL:        fileURL,
+			BaseName:       name,
+			DateFormatted:  dateFormatted,
+			Amount:         amt,
+			DriveService:   driveService,
+			ObjectFolderID: folderID,
+		})
+	}
+	if len(tasks) == 0 {
+		return
+	}
+	startWorkers(numWorkers, driveService, folderID)
+	go func() {
+		for _, task := range tasks {
+			taskQueue <- task
+		}
+		close(taskQueue)
+	}()
+	var links []string
+	processedFiles := make(map[string]bool)
+	for range tasks {
+		result := <-resultsChan
+		if result.Error == nil {
+			links = append(links, result.DriveLink)
+			processedFiles[result.FileID] = true
+		}
+	}
+	close(resultsChan)
+	mediaGroupCacheMu.Lock()
+	if group, ok := mediaGroupCache[mediaGroupID]; ok {
+		for id := range processedFiles {
+			group.Files[id] = true
+		}
+	}
+	mediaGroupCacheMu.Unlock()
+	if len(links) == 0 {
+		bot.Send(tgbotapi.NewMessage(chatID, "Не удалось загрузить фотографии."))
+		return
+	}
 	parsedData := ParsedData{
-		Address:   groupData.Address,
-		Amount:    groupData.Amount,
-		Comment:   groupData.Comment,
-		Username:  groupData.Username,
+		Address:   addr,
+		Amount:    amt,
+		Comment:   comm,
+		Username:  username,
 		Date:      time.Now().In(moscow).Format("02/01/2006 15:04:05"),
-		DriveLink: strings.Join(links, "\n"),
+		DriveLink: strings.Join(links, " "),
 	}
-
-	if err := appendToSheet(sheetsService, spreadsheetId, parsedData); err != nil {
-		notifyAdminAboutSheetError(bot, adminID, err, mediaGroupID)
-		bot.Send(tgbotapi.NewMessage(groupData.ChatID, "Ошибка записи в таблицу"))
-	} else {
-		bot.Send(tgbotapi.NewMessage(groupData.ChatID, fmt.Sprintf("Успешно загружено %d/%d файлов", len(links), len(groupData.Files))))
-	}
+	go func() {
+		if err := appendToSheet(sheetsService, spreadsheetId, parsedData); err != nil {
+			notifyAdminAboutSheetError(bot, adminID, err, mediaGroupID)
+		}
+	}()
+	bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("Обработано %d фото.", len(links))))
 }
 
 func notifyAdminAboutSheetError(bot *tgbotapi.BotAPI, adminID int64, err error, mediaGroupID string) {
@@ -567,39 +633,26 @@ func notifyAdminAboutSheetError(bot *tgbotapi.BotAPI, adminID int64, err error, 
 }
 
 func downloadAndUploadFile(fileURL, baseName, dateFormatted, amount string, driveService *drive.Service, folderID string) (string, error) {
-	var link string
-	err := retry.Do(func() error {
-		resp, err := http.Get(fileURL)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-
-		fileName := sanitizeFileName(fmt.Sprintf("%s_%s_%s.jpg", baseName, dateFormatted, amount))
-
-		// Use memory buffer instead of temp file
-		var buf bytes.Buffer
-		if _, err := io.Copy(&buf, resp.Body); err != nil {
-			return err
-		}
-
-		file := &drive.File{
-			Name:    fileName,
-			Parents: []string{folderID},
-		}
-		res, err := driveService.Files.Create(file).Media(bytes.NewReader(buf.Bytes())).Fields("webViewLink").Do()
-		if err != nil {
-			return err
-		}
-
-		link = res.WebViewLink
-		return nil
-	},
-		retry.Attempts(3),
-		retry.Delay(1*time.Second),
-	)
-
-	return link, err
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		return "", fmt.Errorf("ошибка скачивания: %v", err)
+	}
+	defer resp.Body.Close()
+	fileName := sanitizeFileName(fmt.Sprintf("%s_%s_%s.jpg", baseName, dateFormatted, amount))
+	tmpFile, err := os.CreateTemp("", fileName)
+	if err != nil {
+		return "", fmt.Errorf("ошибка создания temp файла: %v", err)
+	}
+	_, err = io.Copy(tmpFile, resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("ошибка копирования: %v", err)
+	}
+	tmpFile.Close()
+	link, err := uploadFileToDrive(driveService, tmpFile.Name(), fileName, folderID)
+	if err != nil {
+		return "", fmt.Errorf("ошибка загрузки на Drive: %v", err)
+	}
+	return link, nil
 }
 
 func getFullName(user *tgbotapi.User) string {
