@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,7 +36,7 @@ const (
 
 	sheetIDRange = "'Чеки'!B:B"
 	sheetUpdate  = "'Чеки'!B%d:G%d"
-	sheetPropID  = 1051413829
+	tokenFile    = "token.json"
 )
 
 var (
@@ -60,11 +59,6 @@ type ParsedData struct {
 	Address, Amount, Comment, Username, Date, DriveLink string
 }
 
-type TokenInfo struct {
-	AccessToken, TokenType, RefreshToken string
-	Expiry                               time.Time
-}
-
 type MediaGroupData struct {
 	Files                             map[string]*tgbotapi.PhotoSize
 	Caption, Address, Amount, Comment string
@@ -79,6 +73,29 @@ type fieldMatch struct {
 	start, end int
 }
 
+func saveTokenToFile(token *oauth2.Token) error {
+	data, err := json.Marshal(token)
+	if err != nil {
+		return fmt.Errorf("ошибка маршалинга токена: %v", err)
+	}
+	return os.WriteFile(tokenFile, data, 0600)
+}
+
+func loadTokenFromFile() (*oauth2.Token, error) {
+	data, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return nil, err
+	}
+	var token oauth2.Token
+	if err := json.Unmarshal(data, &token); err != nil {
+		return nil, err
+	}
+	return &token, nil
+}
+
+// ==========================
+// Конфигурация и инициализация
+// ==========================
 func loadEnvVars() (telegramToken, spreadsheetID, driveFolderID string, adminID int64, googleClientID, googleClientSecret, webhookURL string) {
 	telegramToken = os.Getenv("TELEGRAM_BOT_TOKEN")
 	spreadsheetID = os.Getenv("GOOGLE_SHEET_ID")
@@ -92,7 +109,6 @@ func loadEnvVars() (telegramToken, spreadsheetID, driveFolderID string, adminID 
 		googleClientID == "" || googleClientSecret == "" || webhookURL == "" {
 		log.Fatal("Одна или несколько обязательных переменных окружения не установлены ❌")
 	}
-
 	var err error
 	adminID, err = strconv.ParseInt(adminStr, 10, 64)
 	if err != nil {
@@ -101,15 +117,18 @@ func loadEnvVars() (telegramToken, spreadsheetID, driveFolderID string, adminID 
 	return
 }
 
+// ==========================
+// OAuth функции
+// ==========================
 func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 	tokenMutex.Lock()
-	token, err := loadTokenFromEnv()
+	token, err := loadTokenFromFile()
 	tokenMutex.Unlock()
 
 	if err == nil && token.Valid() {
 		if time.Until(token.Expiry) < tokenRefreshWindow && token.RefreshToken != "" {
 			if newToken, err := refreshToken(config, token); err == nil {
-				_ = saveTokenToEnv(newToken)
+				_ = saveTokenToFile(newToken)
 				return config.Client(context.Background(), newToken), nil
 			}
 		}
@@ -131,7 +150,7 @@ func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 		if err != nil {
 			return nil, fmt.Errorf("ошибка обмена кода: %v", err)
 		}
-		_ = saveTokenToEnv(token)
+		_ = saveTokenToFile(token)
 		return config.Client(context.Background(), token), nil
 	case err := <-errCh:
 		return nil, fmt.Errorf("ошибка OAuth сервера: %v", err)
@@ -164,50 +183,6 @@ func startOAuthServer(errCh chan error) *http.Server {
 	return server
 }
 
-func saveTokenToEnv(token *oauth2.Token) error {
-	if token == nil {
-		return errors.New("пустой токен")
-	}
-	info := TokenInfo{
-		AccessToken:  token.AccessToken,
-		TokenType:    token.TokenType,
-		RefreshToken: token.RefreshToken,
-		Expiry:       token.Expiry,
-	}
-	if token.RefreshToken == "" && os.Getenv("GOOGLE_OAUTH_TOKEN") != "" {
-		if old, err := loadTokenFromEnv(); err == nil && old.RefreshToken != "" {
-			info.RefreshToken = old.RefreshToken
-		}
-	}
-	data, err := json.Marshal(info)
-	if err != nil {
-		return fmt.Errorf("ошибка маршалинга: %v", err)
-	}
-	encoded := base64.StdEncoding.EncodeToString(data)
-	return os.Setenv("GOOGLE_OAUTH_TOKEN", encoded)
-}
-
-func loadTokenFromEnv() (*oauth2.Token, error) {
-	tokenStr := os.Getenv("GOOGLE_OAUTH_TOKEN")
-	if tokenStr == "" {
-		return nil, errors.New("токен не найден")
-	}
-	data, err := base64.StdEncoding.DecodeString(tokenStr)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка декодирования: %v", err)
-	}
-	var info TokenInfo
-	if err = json.Unmarshal(data, &info); err != nil {
-		return nil, fmt.Errorf("ошибка анмаршалинга: %v", err)
-	}
-	return &oauth2.Token{
-		AccessToken:  info.AccessToken,
-		TokenType:    info.TokenType,
-		RefreshToken: info.RefreshToken,
-		Expiry:       info.Expiry,
-	}, nil
-}
-
 func refreshToken(config *oauth2.Config, token *oauth2.Token) (*oauth2.Token, error) {
 	var newToken *oauth2.Token
 	var err error
@@ -224,7 +199,10 @@ func refreshToken(config *oauth2.Config, token *oauth2.Token) (*oauth2.Token, er
 	return nil, fmt.Errorf("не удалось обновить токен после %d попыток: %v", maxRetries, err)
 }
 
-func ensureObjectFolder(srv *drive.Service, parentID, name string) (string, error) {
+// ==========================
+// Функции работы с Google Drive
+// ==========================
+func ensureObjectFolder(srv *drive.Service, parentID, name string) (string, string, error) {
 	name = sanitizeFileName(strings.TrimSpace(name))
 	if name == "" {
 		name = "Разное"
@@ -241,12 +219,12 @@ func ensureObjectFolder(srv *drive.Service, parentID, name string) (string, erro
 		time.Sleep(time.Duration(retryDelay*(i+1)) * time.Second)
 	}
 	if err != nil {
-		return "", fmt.Errorf("поиск папки не удался: %v", err)
+		return "", "", fmt.Errorf("поиск папки не удался: %v", err)
 	}
 	if len(fl.Files) > 0 {
-		return fl.Files[0].Id, nil
+		return fl.Files[0].Id, "Чек загружен в существующую папку", nil
 	}
-	// Создаём папку, если не найдено
+	// Создаём новую папку
 	folder := &drive.File{
 		Name:     name,
 		Parents:  []string{parentID},
@@ -262,9 +240,9 @@ func ensureObjectFolder(srv *drive.Service, parentID, name string) (string, erro
 		time.Sleep(time.Duration(retryDelay*(i+1)) * time.Second)
 	}
 	if err != nil {
-		return "", fmt.Errorf("создание папки не удалось: %v", err)
+		return "", "", fmt.Errorf("создание папки не удалось: %v", err)
 	}
-	return created.Id, nil
+	return created.Id, "Создана новая папка и чек загружен туда", nil
 }
 
 func refreshDriveService(srv *drive.Service, origErr error) (*drive.Service, error) {
@@ -282,6 +260,7 @@ func refreshDriveService(srv *drive.Service, origErr error) (*drive.Service, err
 	return srv, origErr
 }
 
+// downloadAndUploadFile – измените эту функцию, если нужна другая логика загрузки.
 func downloadAndUploadFile(fileURL, fileName string, driveSrv *drive.Service, folderID string) (string, error) {
 	resp, err := http.Get(fileURL)
 	if err != nil {
@@ -344,17 +323,9 @@ func uploadPhotoToDrive(driveSrv *drive.Service, fileURL, parentID, filename str
 	return file.Id, nil
 }
 
-func keepAlive(url string) {
-	ticker := time.NewTicker(10 * time.Minute)
-	go func() {
-		for range ticker.C {
-			if resp, err := http.Get(url); err == nil {
-				resp.Body.Close()
-			}
-		}
-	}()
-}
-
+// ==========================
+// Функции работы с Google Sheets
+// ==========================
 func appendToSheet(srv *sheets.Service, sheetID string, data ParsedData) error {
 	values := []interface{}{data.Date, data.Username, data.Address, data.Amount, data.Comment, data.DriveLink}
 	vr := &sheets.ValueRange{Values: [][]interface{}{values}}
@@ -369,23 +340,35 @@ func appendToSheet(srv *sheets.Service, sheetID string, data ParsedData) error {
 	return err
 }
 
-func notifyAdminSuccess(bot *tgbotapi.BotAPI, adminID int64, data ParsedData, userMsg *tgbotapi.Message) {
-	msgText := fmt.Sprintf("✅ Чек успешно загружен!\n\n"+
-		"Пользователь: %s\nВремя: %s\nАдрес: %s\nСумма: %s\nКомментарий: %s\nСсылка на файл: %s\n\n"+
-		"Исходное сообщение:\n%s",
-		data.Username, data.Date, data.Address, data.Amount, data.Comment, data.DriveLink, userMsg.Text)
+// ==========================
+// Уведомления для администратора
+// ==========================
+func notifyAdminSuccess(bot *tgbotapi.BotAPI, adminID int64, data ParsedData, userMsg *tgbotapi.Message, folderMsg string) {
+	var origMsg string
+	if userMsg != nil {
+		origMsg = userMsg.Text
+	}
+	msgText := fmt.Sprintf("✅ Чек успешно загружен!\n\nПользователь: %s\nВремя: %s\nАдрес: %s\nСумма: %s\nКомментарий: %s\nСсылка на файл: %s\nПапка: %s\n\nИсходное сообщение:\n%s",
+		data.Username, data.Date, data.Address, data.Amount, data.Comment, data.DriveLink, folderMsg, origMsg)
 	adminMsg := tgbotapi.NewMessage(adminID, msgText)
 	bot.Send(adminMsg)
 }
 
 func notifyAdminFailure(bot *tgbotapi.BotAPI, adminID int64, err error, userMsg *tgbotapi.Message) {
-	msgText := fmt.Sprintf("❗️ Ошибка обработки чека!\n\n"+
-		"Пользователь: %s\nИсходное сообщение:\n%s\n\nОшибка: %v",
-		getFullName(userMsg.From), userMsg.Text, err)
+	var origMsg, userName string
+	if userMsg != nil {
+		origMsg = userMsg.Text
+		userName = getFullName(userMsg.From)
+	}
+	msgText := fmt.Sprintf("❗️ Ошибка обработки чека!\n\nПользователь: %s\nИсходное сообщение:\n%s\n\nОшибка: %v",
+		userName, origMsg, err)
 	adminMsg := tgbotapi.NewMessage(adminID, msgText)
 	bot.Send(adminMsg)
 }
 
+// ==========================
+// Функции парсинга и вспомогательные
+// ==========================
 func parseMessage(message string) (string, string, string, error) {
 	if strings.TrimSpace(message) == "" {
 		return "", "", "", errors.New("пустое сообщение")
@@ -499,6 +482,9 @@ func getFullName(user *tgbotapi.User) string {
 	return user.FirstName
 }
 
+// ==========================
+// Telegram Хендлеры
+// ==========================
 func handleSinglePhotoMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, sheetsSrv *sheets.Service, sheetID string, driveSrv *drive.Service, parentID string, adminID int64) {
 	if msg.Caption == "" {
 		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❗️ Укажи адрес и сумму в подписи к фото в формате:\nАдрес: ...\nСумма: ..."))
@@ -515,6 +501,13 @@ func handleSinglePhotoMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, sheet
 		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❗️ Обязательно укажи адрес и сумму в подписи!"))
 		return
 	}
+	// Определяем папку для загрузки чека
+	folderID, folderMsg, err := ensureObjectFolder(driveSrv, parentID, addr)
+	if err != nil {
+		notifyAdminFailure(bot, adminID, fmt.Errorf("ошибка обработки объекта: %v", err), msg)
+		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❗️ Ошибка обработки объекта: "+err.Error()))
+		return
+	}
 	best := msg.Photo[len(msg.Photo)-1]
 	fileURL, err := bot.GetFileDirectURL(best.FileID)
 	if err != nil {
@@ -522,7 +515,7 @@ func handleSinglePhotoMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, sheet
 		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❗️ Не удалось получить фото: "+err.Error()))
 		return
 	}
-	fileID, err := uploadPhotoToDrive(driveSrv, fileURL, parentID, fmt.Sprintf("check_%s", time.Now().Format("20060102_150405")))
+	fileID, err := uploadPhotoToDrive(driveSrv, fileURL, folderID, fmt.Sprintf("check_%s", time.Now().Format("20060102_150405")))
 	if err != nil {
 		notifyAdminFailure(bot, adminID, fmt.Errorf("не удалось загрузить фото в Google Drive: %v", err), msg)
 		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❗️ Не удалось загрузить фото в Google Drive: "+err.Error()))
@@ -543,7 +536,7 @@ func handleSinglePhotoMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, sheet
 		return
 	}
 	bot.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("✅ Чек успешно загружен!\nАдрес: %s\nСумма: %s", addr, amt)))
-	notifyAdminSuccess(bot, adminID, parsedData, msg)
+	notifyAdminSuccess(bot, adminID, parsedData, msg, folderMsg)
 }
 
 func handleMediaGroupMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, sheetsSrv *sheets.Service, sheetID string, driveSrv *drive.Service, parentID string, adminID int64) {
@@ -619,7 +612,8 @@ func processMediaGroup(bot *tgbotapi.BotAPI, groupID string, sheetsSrv *sheets.S
 		bot.Send(tgbotapi.NewMessage(chatID, "❗️ Укажи адрес и сумму в подписи к первому фото группы!"))
 		return
 	}
-	folderID, err := ensureObjectFolder(driveSrv, parentID, addr)
+	// Определяем папку для загрузки чека
+	folderID, folderMsg, err := ensureObjectFolder(driveSrv, parentID, addr)
 	if err != nil {
 		notifyAdminFailure(bot, adminID, fmt.Errorf("ошибка обработки объекта: %v", err), nil)
 		bot.Send(tgbotapi.NewMessage(chatID, "❗️ Ошибка обработки объекта: "+err.Error()))
@@ -676,10 +670,31 @@ func processMediaGroup(bot *tgbotapi.BotAPI, groupID string, sheetsSrv *sheets.S
 	mediaGroupCacheMu.Unlock()
 	bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Чек успешно загружен!\nФото: %d/%d обработано\nАдрес: %s\nСумма: %s\nКомментарий: %s",
 		len(links), len(photos), addr, amt, comm)))
-	notifyAdminSuccess(bot, adminID, parsedData, nil)
+	notifyAdminSuccess(bot, adminID, parsedData, nil, folderMsg)
 }
 
+// ==========================
+// Функция keep-alive для предотвращения засыпания
+// ==========================
+func keepAlive(url string) {
+	// Пинг каждые 60 минут
+	ticker := time.NewTicker(1 * time.Hour)
+	go func() {
+		for range ticker.C {
+			if resp, err := http.Get(url); err == nil {
+				resp.Body.Close()
+			} else {
+				log.Printf("Ошибка пинга keepAlive: %v", err)
+			}
+		}
+	}()
+}
+
+// ==========================
+// HTTP сервер и обработка обновлений Telegram
+// ==========================
 func setupHandler(bot *tgbotapi.BotAPI, sheetsSrv *sheets.Service, sheetID string, driveSrv *drive.Service, parentID string, adminID int64) {
+	// Очистка устаревших данных медиагрупп
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
@@ -728,6 +743,9 @@ func setupHandler(bot *tgbotapi.BotAPI, sheetsSrv *sheets.Service, sheetID strin
 	})
 }
 
+// ==========================
+// Main функция
+// ==========================
 func main() {
 	telegramToken, sheetID, driveFolderID, adminID, googleClientID, googleClientSecret, webhookURL := loadEnvVars()
 
@@ -742,8 +760,9 @@ func main() {
 		Endpoint: google.Endpoint,
 	}
 
+	// Фоновая задача для автоматического обновления токена каждые 60 минут
 	go func() {
-		ticker := time.NewTicker(30 * time.Minute)
+		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 		for range ticker.C {
 			_, _ = getOAuthClient(oauthConfig)
