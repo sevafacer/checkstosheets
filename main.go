@@ -142,8 +142,7 @@ func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 		defer cancel()
 		server.Shutdown(ctx)
 	}()
-	authURL := config.AuthCodeURL(oauthState, oauth2.AccessTypeOffline, oauth2.ApprovalForce)
-	fmt.Printf("👉 Перейдите по ссылке для авторизации:\n%s\n", authURL)
+	// Отладочный вывод удалён
 	select {
 	case code := <-authCodeCh:
 		token, err := config.Exchange(context.Background(), code)
@@ -260,7 +259,6 @@ func refreshDriveService(srv *drive.Service, origErr error) (*drive.Service, err
 	return srv, origErr
 }
 
-// downloadAndUploadFile – измените эту функцию, если нужна другая логика загрузки.
 func downloadAndUploadFile(fileURL, fileName string, driveSrv *drive.Service, folderID string) (string, error) {
 	resp, err := http.Get(fileURL)
 	if err != nil {
@@ -501,7 +499,6 @@ func handleSinglePhotoMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, sheet
 		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❗️ Обязательно укажи адрес и сумму в подписи!"))
 		return
 	}
-	// Определяем папку для загрузки чека
 	folderID, folderMsg, err := ensureObjectFolder(driveSrv, parentID, addr)
 	if err != nil {
 		notifyAdminFailure(bot, adminID, fmt.Errorf("ошибка обработки объекта: %v", err), msg)
@@ -612,7 +609,6 @@ func processMediaGroup(bot *tgbotapi.BotAPI, groupID string, sheetsSrv *sheets.S
 		bot.Send(tgbotapi.NewMessage(chatID, "❗️ Укажи адрес и сумму в подписи к первому фото группы!"))
 		return
 	}
-	// Определяем папку для загрузки чека
 	folderID, folderMsg, err := ensureObjectFolder(driveSrv, parentID, addr)
 	if err != nil {
 		notifyAdminFailure(bot, adminID, fmt.Errorf("ошибка обработки объекта: %v", err), nil)
@@ -677,14 +673,13 @@ func processMediaGroup(bot *tgbotapi.BotAPI, groupID string, sheetsSrv *sheets.S
 // Функция keep-alive для предотвращения засыпания
 // ==========================
 func keepAlive(url string) {
-	// Пинг каждые 60 минут
-	ticker := time.NewTicker(1 * time.Hour)
+	// Пинг каждые 5 минут для предотвращения засыпания на бесплатном тарифе Railway
+	ticker := time.NewTicker(5 * time.Minute)
 	go func() {
 		for range ticker.C {
+			// Выполняем пинг без отладочного вывода
 			if resp, err := http.Get(url); err == nil {
 				resp.Body.Close()
-			} else {
-				log.Printf("Ошибка пинга keepAlive: %v", err)
 			}
 		}
 	}()
@@ -787,7 +782,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("Ошибка инициализации бота: %v", err)
 	}
-	bot.Debug = true
+	// Отключаем отладочный вывод
+	// bot.Debug = true  <- данная строка удалена
 
 	parsedURL, err := url.Parse(webhookURL)
 	if err != nil {
