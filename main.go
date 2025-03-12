@@ -142,7 +142,9 @@ func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 		defer cancel()
 		server.Shutdown(ctx)
 	}()
-	// Отладочный вывод удалён
+	authURL := config.AuthCodeURL(oauthState, oauth2.AccessTypeOffline, oauth2.ApprovalForce)
+	// Выводим ссылку для авторизации, чтобы пользователь мог перейти по ней
+	fmt.Printf("👉 Перейдите по ссылке для авторизации:\n%s\n", authURL)
 	select {
 	case code := <-authCodeCh:
 		token, err := config.Exchange(context.Background(), code)
@@ -677,7 +679,6 @@ func keepAlive(url string) {
 	ticker := time.NewTicker(5 * time.Minute)
 	go func() {
 		for range ticker.C {
-			// Выполняем пинг без отладочного вывода
 			if resp, err := http.Get(url); err == nil {
 				resp.Body.Close()
 			}
@@ -782,8 +783,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Ошибка инициализации бота: %v", err)
 	}
-	// Отключаем отладочный вывод
-	// bot.Debug = true  <- данная строка удалена
+	// Отладочный вывод отключён
 
 	parsedURL, err := url.Parse(webhookURL)
 	if err != nil {
