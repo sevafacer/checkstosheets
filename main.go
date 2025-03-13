@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/nao1215/markdown"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
@@ -725,11 +727,27 @@ func setupHandler(bot *tgbotapi.BotAPI, sheetsSrv *sheets.Service, sheetID strin
 			if update.Message.IsCommand() {
 				switch update.Message.Command() {
 				case "start", "help":
-					helpText := `Привет!
-Отправь фото чека с подписью в формате:
-Адрес: ...
-Сумма: ...`
-					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, helpText))
+					// Используем markdown для форматирования текста
+					var buf bytes.Buffer
+					builder := markdown.NewMarkdown(&buf)
+					builder.
+						H1("Бот для отслеживания чеков!").
+						LF().
+						PlainText("Бот помогает добавлять информацию о чеках в Google-таблицу и отслеживать расходы.").
+						LF().
+						PlainText("Отправьте фото чека с подписью в формате:").
+						LF().
+						CodeBlocks(markdown.SyntaxHighlightGo, "Адрес: ...\nСумма: ...").
+						LF().
+						PlainText("💡 Подсказка: Введите информацию с клавиатуры.")
+
+					builder.Build()
+					helpText := buf.String()
+
+					// Отправляем сообщение через Telegram с ParseMode MarkdownV2
+					msg := tgbotapi.NewMessage(update.Message.Chat.ID, helpText)
+					msg.ParseMode = "MarkdownV2"
+					bot.Send(msg)
 				}
 			} else if update.Message.Photo != nil {
 				go handleMediaGroupMessage(bot, update.Message, sheetsSrv, sheetID, driveSrv, parentID, adminID)
