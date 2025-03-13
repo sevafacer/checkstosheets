@@ -692,21 +692,6 @@ func keepAlive(url string) {
 // HTTP сервер и обработка обновлений Telegram
 // ==========================
 
-func sendStartButton(bot *tgbotapi.BotAPI, chatID int64) {
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Начать работу", "start_command"),
-		),
-	)
-
-	msg := tgbotapi.NewMessage(chatID, "Добро пожаловать! Нажмите кнопку, чтобы начать работу с ботом.")
-	msg.ReplyMarkup = keyboard
-
-	if _, err := bot.Send(msg); err != nil {
-		log.Printf("Ошибка отправки кнопки start: %v", err)
-	}
-}
-
 func setupHandler(bot *tgbotapi.BotAPI, sheetsSrv *sheets.Service, sheetID string, driveSrv *drive.Service, parentID string, adminID int64) {
 	// Очистка устаревших данных медиагрупп
 	go func() {
@@ -724,100 +709,70 @@ func setupHandler(bot *tgbotapi.BotAPI, sheetsSrv *sheets.Service, sheetID strin
 		}
 	}()
 
-	// Добавляем кнопку start при первом входе пользователя
-	userStates := make(map[int64]bool) // Для отслеживания новых пользователей
-
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "Unsupported method", http.StatusMethodNotAllowed)
 			return
 		}
-
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
 			return
 		}
-
 		var update tgbotapi.Update
 		if err = json.Unmarshal(body, &update); err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
 			return
 		}
 
-		// Обрабатываем сообщения
 		if update.Message != nil {
-			// Проверка нового пользователя и отправка кнопки
-			_, exists := userStates[update.Message.From.ID]
-			if !exists {
-				userStates[update.Message.From.ID] = true
-				sendStartButton(bot, update.Message.Chat.ID)
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-
+			// Обработка команды /start или /help
 			if update.Message.IsCommand() {
 				switch update.Message.Command() {
 				case "start", "help":
-					var buf bytes.Buffer
-					builder := markdown.NewMarkdown(&buf)
-					builder.
-						H1("Бот для отслеживания чеков!").
-						LF().
-						PlainText("Бот помогает добавлять информацию о чеках в Google-таблицу и отслеживать расходы.").
-						LF().
-						PlainText("Отправьте фото чека с подписью в формате:").
-						LF().
-						CodeBlocks(markdown.SyntaxHighlightGo, "Адрес: ...\nСумма: ...").
-						LF().
-						PlainText("💡 Подсказка: Введите информацию с клавиатуры.")
-
-					builder.Build()
-					helpText := buf.String()
-
-					msg := tgbotapi.NewMessage(update.Message.Chat.ID, helpText)
-					msg.ParseMode = "MarkdownV2"
-					if _, err := bot.Send(msg); err != nil {
-						log.Printf("Ошибка отправки сообщения: %v", err)
-					}
+					sendHelpMessage(bot, update.Message.Chat.ID)
 				}
+			} else if update.Message.Text == "Начать" {
+				// Если пользователь нажал кнопку "Начать"
+				sendHelpMessage(bot, update.Message.Chat.ID)
 			} else if update.Message.Photo != nil {
 				go handleMediaGroupMessage(bot, update.Message, sheetsSrv, sheetID, driveSrv, parentID, adminID)
 			}
-		} else if update.CallbackQuery != nil {
-			// Обработка нажатия на кнопку
-			if update.CallbackQuery.Data == "start_command" {
-				var buf bytes.Buffer
-				builder := markdown.NewMarkdown(&buf)
-				builder.
-					H1("Бот для отслеживания чеков!").
-					LF().
-					PlainText("Бот помогает добавлять информацию о чеках в Google-таблицу и отслеживать расходы.").
-					LF().
-					PlainText("Отправьте фото чека с подписью в формате:").
-					LF().
-					CodeBlocks(markdown.SyntaxHighlightGo, "Адрес: ...\nСумма: ...").
-					LF().
-					PlainText("💡 Подсказка: Введите информацию с клавиатуры.")
-
-				builder.Build()
-				helpText := buf.String()
-
-				// Отвечаем на callback
-				callback := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
-				bot.AnswerCallbackQuery(callback)
-
-				// Отправляем основное сообщение
-				msg := tgbotapi.NewMessage(update.CallbackQuery.Message.Chat.ID, helpText)
-				msg.ParseMode = "MarkdownV2"
-				if _, err := bot.Send(msg); err != nil {
-					log.Printf("Ошибка отправки сообщения: %v", err)
-				}
-			}
 		}
-
 		w.WriteHeader(http.StatusOK)
 	})
+}
+
+// sendHelpMessage формирует сообщение с помощью markdown и отправляет его с кнопкой "Начать"
+func sendHelpMessage(bot *tgbotapi.BotAPI, chatID int64) {
+	var buf bytes.Buffer
+	builder := markdown.NewMarkdown(&buf)
+	builder.
+		H1("Бот для отслеживания чеков!").
+		LF().
+		PlainText("Бот помогает добавлять информацию о чеках в Google-таблицу и отслеживать расходы.").
+		LF().
+		PlainText("Отправьте фото чека с подписью в формате:").
+		LF().
+		CodeBlocks(markdown.SyntaxHighlightGo, "Адрес: ...\nСумма: ...").
+		LF().
+		PlainText("💡 Подсказка: Введите информацию с клавиатуры.")
+	builder.Build()
+	helpText := buf.String()
+
+	// Создаем reply-клавиатуру с кнопкой "Начать"
+	startButton := tgbotapi.NewKeyboardButton("Начать")
+	keyboard := tgbotapi.NewReplyKeyboard(
+		[]tgbotapi.KeyboardButton{startButton},
+	)
+
+	msg := tgbotapi.NewMessage(chatID, helpText)
+	msg.ParseMode = "MarkdownV2"
+	msg.ReplyMarkup = keyboard
+
+	if _, err := bot.Send(msg); err != nil {
+		log.Println("Ошибка отправки сообщения:", err)
+	}
 }
 
 // ==========================
