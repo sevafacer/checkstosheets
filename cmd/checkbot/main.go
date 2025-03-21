@@ -69,6 +69,8 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, cq *tgbotapi.CallbackQuery) {
 	if strings.HasPrefix(cq.Data, "select_obj:") {
 		selected := strings.TrimPrefix(cq.Data, "select_obj:")
 		chatID := cq.Message.Chat.ID
+
+		// Блокировка для работы с sessionStore
 		sessionStore.Lock()
 		if sess, exists := sessionStore.data[chatID]; exists {
 			sess.SelectedObject = selected
@@ -84,9 +86,19 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, cq *tgbotapi.CallbackQuery) {
 			}
 		}
 		sessionStore.Unlock()
-		bot.AnswerCallbackQuery(tgbotapi.NewCallback(cq.ID, fmt.Sprintf("Объект \"%s\" выбран", selected)))
+
+		// Отправляем ответ на callback-запрос
+		callback := tgbotapi.NewCallback(cq.ID, fmt.Sprintf("Объект \"%s\" выбран", selected))
+		if _, err := bot.Request(callback); err != nil {
+			fmt.Printf("Ошибка при ответе на callback: %v\n", err)
+			return
+		}
+
+		// Отправляем сообщение пользователю
 		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Объект \"%s\" выбран. Теперь отправьте фото или медиагруппу для этого объекта.", selected))
-		bot.Send(msg)
+		if _, err := bot.Send(msg); err != nil {
+			fmt.Printf("Ошибка при отправке сообщения: %v\n", err)
+		}
 	}
 }
 
