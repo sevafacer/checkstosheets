@@ -1,9 +1,9 @@
 package config
 
 import (
-	"encoding/json"
 	"log"
 	"os"
+	"strings"
 )
 
 var Objects []string
@@ -11,9 +11,7 @@ var Objects []string
 func LoadObjects() {
 	envObjs := os.Getenv("OBJECTS_LIST")
 	if envObjs != "" {
-		if err := json.Unmarshal([]byte(envObjs), &Objects); err != nil {
-			log.Fatalf("Ошибка парсинга объектов из переменной окружения: %v", err)
-		}
+		Objects = strings.Split(envObjs, ", ")
 		return
 	}
 	log.Fatal("Переменная окружения OBJECTS_LIST не задана")
