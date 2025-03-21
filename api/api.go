@@ -61,6 +61,7 @@ func LoadEnvVars() (string, string, string, int64, string) {
 		log.Fatal("Одна или несколько обязательных переменных окружения не установлены")
 	}
 	var err error
+	adminStr = strings.TrimSpace(os.Getenv("ADMIN_CHAT_ID"))
 	adminID, err = strconv.ParseInt(adminStr, 10, 64)
 	if err != nil {
 		log.Fatalf("Неверный формат ADMIN_CHAT_ID: %v", err)
