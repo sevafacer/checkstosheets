@@ -32,7 +32,7 @@ const (
 	maxRetries           = 3
 	retryDelay           = 2
 	tokenRefreshWindow   = 5 * time.Minute
-	maxConcurrentUploads = 5
+	maxConcurrentUploads = 10
 
 	sheetIDRange = "'Чеки'!B:B"
 	sheetUpdate  = "'Чеки'!B%d:G%d"
@@ -48,11 +48,11 @@ var (
 
 	tokenMutex        sync.Mutex
 	mediaGroupCacheMu sync.Mutex
-
-	oauthConfig     *oauth2.Config
-	oauthState      = "state-token"
-	authCodeCh      = make(chan string)
-	mediaGroupCache = make(map[string]*MediaGroupData)
+	mediaGroupTimeout = 3 * time.Second
+	oauthConfig       *oauth2.Config
+	oauthState        = "state-token"
+	authCodeCh        = make(chan string)
+	mediaGroupCache   = make(map[string]*MediaGroupData)
 )
 
 var objectAddresses = []string{
@@ -77,12 +77,18 @@ type ParsedData struct {
 }
 
 type MediaGroupData struct {
-	Files                             map[string]*tgbotapi.PhotoSize
-	Caption, Address, Amount, Comment string
-	Username                          string
-	FirstMessageTime, LastUpdated     time.Time
-	UserID, ChatID                    int64
-	IsProcessing                      bool
+	Files            map[string]*tgbotapi.PhotoSize
+	Caption          string
+	Address          string
+	Amount           string
+	Comment          string
+	FirstMessageTime time.Time
+	LastUpdated      time.Time
+	UserID           int64
+	ChatID           int64
+	Username         string
+	IsProcessing     bool
+	ProcessTimer     *time.Timer // Таймер для отложенной обработки
 }
 
 type fieldMatch struct {
@@ -499,9 +505,6 @@ func processPhoto(bot *tgbotapi.BotAPI, fileID string, driveSrv *drive.Service, 
 
 // Исправленная функция обработки медиа-группы
 func processMediaGroup(bot *tgbotapi.BotAPI, groupID string, sheetsSrv *sheets.Service, sheetID string, driveSrv *drive.Service, parentID string, adminID int64) {
-	// Даем немного времени для получения всех сообщений в группе
-	time.Sleep(500 * time.Millisecond)
-
 	mediaGroupCacheMu.Lock()
 	group, exists := mediaGroupCache[groupID]
 	if !exists || len(group.Files) == 0 {
@@ -509,12 +512,27 @@ func processMediaGroup(bot *tgbotapi.BotAPI, groupID string, sheetsSrv *sheets.S
 		return
 	}
 
+	// Проверяем, что группа еще не обрабатывается
+	if group.IsProcessing {
+		mediaGroupCacheMu.Unlock()
+		return
+	}
+
+	// Помечаем группу как обрабатываемую
+	group.IsProcessing = true
+
+	// Копируем все необходимые данные, чтобы не держать блокировку
 	addr, amt, comm, chatID, username := group.Address, group.Amount, group.Comment, group.ChatID, group.Username
+
+	// Создаем копию массива фотографий
 	var photos []*tgbotapi.PhotoSize
 	for _, p := range group.Files {
 		photos = append(photos, p)
 	}
 	mediaGroupCacheMu.Unlock()
+
+	// Логируем начало обработки
+	log.Printf("Начало обработки медиа-группы %s с %d фотографиями", groupID, len(photos))
 
 	if addr == "" || amt == "" {
 		bot.Send(tgbotapi.NewMessage(chatID, "❗️ Укажи адрес и сумму в подписи к первому фото группы!"))
@@ -542,6 +560,8 @@ func processMediaGroup(bot *tgbotapi.BotAPI, groupID string, sheetsSrv *sheets.S
 			link, err := processPhoto(bot, p.FileID, driveSrv, folderID, addr, amt, i+1)
 			if err == nil {
 				results <- link
+			} else {
+				log.Printf("Ошибка обработки фото %d в группе %s: %v", i+1, groupID, err)
 			}
 		}(i, photo)
 	}
@@ -576,16 +596,21 @@ func processMediaGroup(bot *tgbotapi.BotAPI, groupID string, sheetsSrv *sheets.S
 		return
 	}
 
+	// Удаляем группу из кеша только после полной обработки
 	mediaGroupCacheMu.Lock()
 	delete(mediaGroupCache, groupID)
 	mediaGroupCacheMu.Unlock()
+
+	// Логируем завершение обработки
+	log.Printf("Завершена обработка медиа-группы %s: %d из %d фото загружено",
+		groupID, len(links), len(photos))
 
 	bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Чек успешно загружен!\nФото: %d/%d обработано\nАдрес: %s\nСумма: %s\nКомментарий: %s",
 		len(links), len(photos), addr, amt, comm)))
 	notifyAdminSuccess(bot, adminID, parsedData, nil, folderMsg)
 }
 
-// Исправленная функция обработки сообщения медиагруппы
+// Обработчик сообщений с медиа-группами
 func handleMediaGroupMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, sheetsSrv *sheets.Service, sheetID string, driveSrv *drive.Service, parentID string, adminID int64) {
 	if len(msg.Photo) == 0 {
 		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❗️ Сообщение не содержит фотографий."))
@@ -599,19 +624,16 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, sheets
 	}
 
 	mediaGroupCacheMu.Lock()
+	defer mediaGroupCacheMu.Unlock()
+
 	group, exists := mediaGroupCache[msg.MediaGroupID]
 
+	// Создаем новую группу, если ее еще нет
 	if !exists {
+		// Парсим адрес и сумму только из первого сообщения
 		addr, amt, comm, err := parseMessage(msg.Caption)
-		if err != nil {
+		if err != nil && msg.Caption != "" { // Проверяем ошибку только если была подпись
 			bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❗️ Не удалось распознать подпись. Укажи адрес и сумму в формате:\nАдрес: ...\nСумма: ..."))
-			mediaGroupCacheMu.Unlock()
-			return
-		}
-
-		if addr == "" || amt == "" {
-			bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❗️ Обязательно укажи адрес и сумму в подписи к фотоальбому!"))
-			mediaGroupCacheMu.Unlock()
 			return
 		}
 
@@ -626,25 +648,44 @@ func handleMediaGroupMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, sheets
 			UserID:           msg.From.ID,
 			ChatID:           msg.Chat.ID,
 			Username:         getFullName(msg.From),
+			IsProcessing:     false,
 		}
 		mediaGroupCache[msg.MediaGroupID] = group
+
+		// Создаем таймер для отложенной обработки медиа-группы
+		group.ProcessTimer = time.AfterFunc(mediaGroupTimeout, func() {
+			processMediaGroup(bot, msg.MediaGroupID, sheetsSrv, sheetID, driveSrv, parentID, adminID)
+		})
+
+		log.Printf("Создана новая медиа-группа: %s", msg.MediaGroupID)
+	} else {
+		// Обновляем группу новыми данными, если пришло сообщение с подписью
+		if msg.Caption != "" && (group.Address == "" || group.Amount == "") {
+			addr, amt, comm, err := parseMessage(msg.Caption)
+			if err == nil {
+				group.Address = addr
+				group.Amount = amt
+				group.Comment = comm
+				group.Caption = msg.Caption
+				log.Printf("Обновлены данные медиа-группы %s: адрес=%s, сумма=%s",
+					msg.MediaGroupID, addr, amt)
+			}
+		}
 	}
 
+	// Добавляем фото в группу
 	best := msg.Photo[len(msg.Photo)-1]
 	if _, ok := group.Files[best.FileID]; !ok {
 		group.Files[best.FileID] = &best
 		group.LastUpdated = time.Now()
-	}
+		log.Printf("Добавлено новое фото в группу %s (всего: %d)",
+			msg.MediaGroupID, len(group.Files))
 
-	// Изменяем логику запуска обработки - обрабатываем после 2+ фото или спустя 1 секунду
-	shouldProcess := !group.IsProcessing &&
-		(len(group.Files) >= 2 || time.Since(group.FirstMessageTime) >= time.Second)
-
-	if shouldProcess {
-		group.IsProcessing = true
-		go processMediaGroup(bot, msg.MediaGroupID, sheetsSrv, sheetID, driveSrv, parentID, adminID)
+		// Сбрасываем таймер при получении нового фото
+		if group.ProcessTimer != nil {
+			group.ProcessTimer.Reset(mediaGroupTimeout)
+		}
 	}
-	mediaGroupCacheMu.Unlock()
 }
 
 // Обновленная функция handleSinglePhotoMessage
