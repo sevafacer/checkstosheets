@@ -735,11 +735,6 @@ func sendObjectsList(bot *tgbotapi.BotAPI, chatID int64) {
 
 	msg := tgbotapi.NewMessage(chatID, messageText)
 
-	// Добавляем кнопку "Вернуться" для возврата в основное меню
-	backButton := tgbotapi.NewKeyboardButton("Вернуться")
-	keyboard := tgbotapi.NewReplyKeyboard([]tgbotapi.KeyboardButton{backButton})
-	msg.ReplyMarkup = keyboard
-
 	bot.Send(msg)
 }
 
@@ -868,7 +863,6 @@ func setupHandler(bot *tgbotapi.BotAPI, sheetsSrv *sheets.Service, sheetID strin
 			} else if update.Message.Text == "Объекты" {
 				// Если пользователь нажал кнопку "Объекты"
 				sendObjectsList(bot, update.Message.Chat.ID)
-			} else if update.Message.Text == "Вернуться" {
 			} else if update.Message.Photo != nil {
 				go handleMediaGroupMessage(bot, update.Message, sheetsSrv, sheetID, driveSrv, parentID, adminID)
 			}
