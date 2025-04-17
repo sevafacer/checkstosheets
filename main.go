@@ -36,7 +36,14 @@ type Config struct {
 
 // Загружает настройки из переменных окружения
 func loadConfig() (*Config, error) {
-	adminID, err := strconv.ParseInt(os.Getenv("ADMIN_CHAT_ID"), 10, 64)
+	adminIDStr := strings.TrimSpace(os.Getenv("ADMIN_CHAT_ID"))
+	if adminIDStr == "" {
+		return nil, fmt.Errorf("ADMIN_CHAT_ID not set")
+	}
+	adminID, err := strconv.ParseInt(adminIDStr, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("ADMIN_CHAT_ID: %w", err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("ADMIN_CHAT_ID: %w", err)
 	}
