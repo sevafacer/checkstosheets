@@ -152,21 +152,27 @@ func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 		defer cancel()
 		server.Shutdown(ctx)
 	}()
+
 	authURL := config.AuthCodeURL(oauthState, oauth2.AccessTypeOffline) // Запрашиваем offline доступ для получения refresh token
 	fmt.Printf("👉 Перейдите по ссылке для авторизации:\n%s\nПосле авторизации скопируйте полученный код и вставьте его в переменную окружения %s в Railway.\n", authURL, tokenEnvName)
 
 	select {
 	case code := <-authCodeCh:
-		token, err = config.Exchange(context.Background(), code) // Переназначаем значение 'token'
+		log.Printf("Получен код авторизации: %s", code)                // Добавлено логирование полученного кода
+		log.Printf("Используемый RedirectURL: %s", config.RedirectURL) // Добавлено логирование RedirectURL
+		token, err = config.Exchange(context.Background(), code)
 		if err != nil {
+			log.Printf("Ошибка при обмене кода: %+v", err) // Более подробный вывод ошибки
 			return nil, fmt.Errorf("ошибка обмена кода: %v", err)
 		}
 		// Важно: Здесь мы получаем новый refresh token. Его нужно вывести пользователю для установки в переменную окружения.
 		log.Printf("Получен новый refresh token: %s\nПожалуйста, установите эту строку в качестве значения переменной окружения %s в Railway.", token.RefreshToken, tokenEnvName)
 		return config.Client(context.Background(), token), nil
 	case err := <-errCh:
+		log.Printf("Ошибка OAuth сервера: %+v", err) // Более подробный вывод ошибки
 		return nil, fmt.Errorf("ошибка OAuth сервера: %v", err)
 	case <-time.After(5 * time.Minute):
+		log.Println("Превышено время ожидания авторизации")
 		return nil, errors.New("превышено время ожидания авторизации ⏰")
 	}
 }
