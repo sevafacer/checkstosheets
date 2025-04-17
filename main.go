@@ -133,10 +133,10 @@ func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 	if err == nil && refreshToken != "" {
 		// Попытка обновить токен с использованием refresh token
 		tokenSource := config.TokenSource(context.Background(), &oauth2.Token{RefreshToken: refreshToken})
-		newToken, err := tokenSource.Token()
+		token, err = tokenSource.Token() // Присваиваем обновленный токен переменной 'token'
 		if err == nil {
 			log.Println("Токен успешно обновлен с использованием refresh token.")
-			return config.Client(context.Background(), newToken), nil
+			return config.Client(context.Background(), token), nil
 		}
 		log.Printf("Не удалось обновить токен с использованием refresh token: %v. Требуется повторная авторизация.", err)
 		// Fallback to the full auth flow if refresh fails
@@ -157,7 +157,7 @@ func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 
 	select {
 	case code := <-authCodeCh:
-		token, err := config.Exchange(context.Background(), code)
+		token, err = config.Exchange(context.Background(), code) // Переназначаем значение 'token'
 		if err != nil {
 			return nil, fmt.Errorf("ошибка обмена кода: %v", err)
 		}
