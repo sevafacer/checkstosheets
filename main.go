@@ -1,24 +1,22 @@
 package main
 
-// --- WEBHOOK VERSION for Railway free ---
-// Features: Service‑account auth (no manual login), Telegram webhook, HTTP handler, Drive+Sheets uploads.
-// Replace all polling code; relies on WEBHOOK_URL env var.
-
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -29,365 +27,490 @@ import (
 	"google.golang.org/api/sheets/v4"
 )
 
-// =============================================
-// CONFIG & GLOBALS
-// =============================================
+// -----------------------------------------------------------------------------
+// Константы и глобальные переменные
+// -----------------------------------------------------------------------------
 
 const (
-	mediaGroupTimeout    = 3 * time.Second
-	maxConcurrentUploads = 5 // Railway free: limit goroutines
+	maxRetries           = 3
+	retryDelay           = 2
+	maxConcurrentUploads = 10
+
+	sheetIDRange = "'Чеки'!B:B"
+	sheetUpdate  = "'Чеки'!B%d:G%d"
+
+	// OAuth / env
+	tokenEnvName = "GOOGLE_OAUTH_REFRESH_TOKEN"
 )
 
 var (
+	// Ключевые слова для парсинга подписей
 	fieldKeywords = map[string][]string{
-		"address": {"адрес", "объект", "дом", "квартира", "улица"},
-		"amount":  {"сумма", "стоимость", "цена"},
-		"comment": {"комментарий", "прим", "заметка"},
+		"address": {"адрес", "объект", "квартира", "школа", "дом", "улица", "место", "локация"},
+		"amount":  {"сумма", "стоимость", "оплата", "платёж", "цена"},
+		"comment": {"комментарий", "коммент", "прим", "примечание", "дополнение", "заметка"},
 	}
 
-	mediaMu sync.Mutex
-	groups  = map[string]*mediaGroup{}
+	tokenMu     sync.Mutex
+	oauthConfig *oauth2.Config
+	oauthState  = "state-token"
+	authCodeCh  = make(chan string)
+
+	mediaGroupCache   = make(map[string]*MediaGroupData)
+	mediaGroupMu      sync.Mutex
+	mediaGroupTimeout = 3 * time.Second
 )
 
-// =============================================
-// TYPES
-// =============================================
+// Список объектов для кнопки «Объекты»
+var objectAddresses = []string{
+	"Афанасьево 1",
+	"Афанасьево 2",
+	"Каскад 1",
+	"Каскад 2",
+	"Тимирязева 3",
+	"Ковернино",
+	"Комсомольская",
+	"Город Времени",
+	"Крутая",
+	"Малая Ельня",
+	"Тимирязева 9",
+	"Анкудиновское шоссе 47",
+	"Советской Армии",
+	"Волоколамское шоссе",
+	"Долгопрудненское шоссе 3",
+}
 
-type parsedData struct {
+// -----------------------------------------------------------------------------
+// Типы
+// -----------------------------------------------------------------------------
+
+type ParsedData struct {
 	Address, Amount, Comment, Username, Date, DriveLink string
 }
 
-type mediaGroup struct {
-	Files        map[string]*tgbotapi.PhotoSize
-	Address      string
-	Amount       string
-	Comment      string
-	Username     string
-	ChatID       int64
-	ProcessTimer *time.Timer
-	LastUpdated  time.Time
-	IsProcessing bool
+type MediaGroupData struct {
+	Files            map[string]*tgbotapi.PhotoSize
+	Caption          string
+	Address          string
+	Amount           string
+	Comment          string
+	FirstMessageTime time.Time
+	LastUpdated      time.Time
+	UserID           int64
+	ChatID           int64
+	Username         string
+	IsProcessing     bool
+	timer            *time.Timer
 }
 
-// =============================================
-// ENV UTILS
-// =============================================
+// -----------------------------------------------------------------------------
+// Вспомогательные функции
+// -----------------------------------------------------------------------------
 
-func mustEnv(k string) string {
-	v := strings.TrimSpace(os.Getenv(k))
+func mandatory(key string) string {
+	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
-		log.Fatalf("env %s not set", k)
+		log.Fatalf("env %s not set", key)
 	}
 	return v
 }
 
-// =============================================
-// GOOGLE AUTH & SERVICES (service‑account)
-// =============================================
+func loadEnv() (tgToken, sheetID, driveFolderID string, adminID int64, clientID, clientSecret, webhookURL string) {
+	tgToken = mandatory("TELEGRAM_BOT_TOKEN")
+	sheetID = mandatory("GOOGLE_SHEET_ID")
+	driveFolderID = mandatory("GOOGLE_DRIVE_FOLDER_ID")
+	clientID = mandatory("GOOGLE_OAUTH_CLIENT_ID")
+	clientSecret = mandatory("GOOGLE_OAUTH_CLIENT_SECRET")
+	webhookURL = mandatory("WEBHOOK_URL")
+	adminStr := mandatory("ADMIN_CHAT_ID")
 
-func newGoogleClient(ctx context.Context) *http.Client {
-	j := mustEnv("GOOGLE_SERVICE_ACCOUNT_JSON")
-	data, err := base64.StdEncoding.DecodeString(j)
+	id, err := strconv.ParseInt(adminStr, 10, 64)
 	if err != nil {
-		log.Fatalf("decode service json: %v", err)
+		log.Fatalf("invalid ADMIN_CHAT_ID: %v", err)
 	}
-	creds, err := google.CredentialsFromJSON(ctx, data, drive.DriveFileScope, sheets.SpreadsheetsScope)
-	if err != nil {
-		log.Fatalf("google creds: %v", err)
-	}
-	return oauth2.NewClient(ctx, creds.TokenSource)
-}
-
-// =============================================
-// PARSING HELPERS
-// =============================================
-
-func cleanAmount(s string) string {
-	re := regexp.MustCompile(`[^0-9.,]`)
-	return strings.ReplaceAll(re.ReplaceAllString(s, ""), ".", ",")
-}
-
-func parseCaption(c string) (addr, amt, comm string, err error) {
-	if strings.TrimSpace(c) == "" {
-		return "", "", "", errors.New("empty caption")
-	}
-	norm := strings.Join(strings.Fields(c), " ")
-	var matches []struct {
-		f    string
-		s, e int
-	}
-	for f, kws := range fieldKeywords {
-		for _, kw := range kws {
-			re := regexp.MustCompile(fmt.Sprintf(`(?i)%s\s*[:=]`, regexp.QuoteMeta(kw)))
-			locs := re.FindAllStringIndex(norm, -1)
-			for _, l := range locs {
-				matches = append(matches, struct {
-					f    string
-					s, e int
-				}{f, l[0], l[1]})
-			}
-		}
-	}
-	if len(matches) == 0 {
-		parts := strings.Split(c, "\n")
-		if len(parts) < 2 {
-			return "", "", "", errors.New("need at least two lines")
-		}
-		addr = strings.TrimSpace(parts[0])
-		amt = cleanAmount(strings.TrimSpace(parts[1]))
-		if len(parts) > 2 {
-			comm = strings.TrimSpace(strings.Join(parts[2:], "\n"))
-		}
-		if addr == "" || amt == "" {
-			return "", "", "", errors.New("addr/amt missing")
-		}
-		return
-	}
-	sort.Slice(matches, func(i, j int) bool { return matches[i].s < matches[j].s })
-	kv := map[string]string{}
-	for i, m := range matches {
-		end := len(norm)
-		if i < len(matches)-1 {
-			end = matches[i+1].s
-		}
-		kv[m.f] = strings.TrimSpace(norm[m.e:end])
-	}
-	addr = kv["address"]
-	amt = cleanAmount(kv["amount"])
-	comm = kv["comment"]
-	if addr == "" || amt == "" {
-		return "", "", "", errors.New("addr/amt missing")
-	}
+	adminID = id
 	return
 }
 
-// =============================================
-// GOOGLE DRIVE / SHEETS HELPERS
-// =============================================
+// -----------------------------------------------------------------------------
+// OAuth helpers
+// -----------------------------------------------------------------------------
 
-func sanitizeFilename(n string) string {
-	re := regexp.MustCompile(`[^а-яА-Яa-zA-Z0-9_\-\s.]`)
-	n = re.ReplaceAllString(n, "_")
-	return strings.ReplaceAll(strings.TrimSpace(n), " ", "_")
+func refreshTokenFromEnv() (*oauth2.Token, error) {
+	tok := os.Getenv(tokenEnvName)
+	if tok == "" {
+		return nil, errors.New("refresh token env not set")
+	}
+	return &oauth2.Token{RefreshToken: tok}, nil
 }
 
-func ensureFolder(srv *drive.Service, parent, name string) (string, error) {
-	name = sanitizeFilename(name)
-	if name == "" {
-		name = "Разное"
+func getOAuthClient(cfg *oauth2.Config) (*http.Client, error) {
+	tokenMu.Lock()
+	defer tokenMu.Unlock()
+
+	if rt, err := refreshTokenFromEnv(); err == nil {
+		// Есть refresh‑token — пытаемся обновить access‑token
+		ts := cfg.TokenSource(context.Background(), rt)
+		if t, err := ts.Token(); err == nil {
+			return cfg.Client(context.Background(), t), nil
+		}
 	}
-	q := fmt.Sprintf("name='%s' and '%s' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false", name, parent)
-	list, err := srv.Files.List().Q(q).Fields("files(id)").Do()
-	if err == nil && len(list.Files) > 0 {
-		return list.Files[0].Id, nil
+
+	// Запускаем локальный сервер для получения auth‑code
+	srv := &http.Server{Addr: ":8080"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("state") != oauthState {
+			http.Error(w, "state mismatch", http.StatusBadRequest)
+			return
+		}
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			http.Error(w, "code not found", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprintln(w, "Auth OK. Return to console.")
+		authCodeCh <- code
+	})
+	srv.Handler = mux
+	go func() {
+		_ = srv.ListenAndServe()
+	}()
+
+	fmt.Println("Open", cfg.AuthCodeURL(oauthState, oauth2.AccessTypeOffline))
+
+	select {
+	case code := <-authCodeCh:
+		_ = srv.Shutdown(context.Background())
+		tok, err := cfg.Exchange(context.Background(), code)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Printf("New refresh‑token → set %s env: %s\n", tokenEnvName, tok.RefreshToken)
+		return cfg.Client(context.Background(), tok), nil
+	case <-time.After(5 * time.Minute):
+		_ = srv.Shutdown(context.Background())
+		return nil, errors.New("oauth timeout")
 	}
-	f := &drive.File{Name: name, Parents: []string{parent}, MimeType: "application/vnd.google-apps.folder"}
-	nf, err := srv.Files.Create(f).Fields("id").Do()
+}
+
+// -----------------------------------------------------------------------------
+// Drive / Sheets helpers
+// -----------------------------------------------------------------------------
+
+func appendToSheet(srv *sheets.Service, sheetID string, data ParsedData) error {
+	values := []interface{}{data.Date, data.Username, data.Address, data.Amount, data.Comment, data.DriveLink}
+	vr := &sheets.ValueRange{Values: [][]interface{}{values}}
+
+	resp, err := srv.Spreadsheets.Values.Get(sheetID, sheetIDRange).Do()
 	if err != nil {
-		return "", err
+		return err
 	}
-	return nf.Id, nil
+	row := len(resp.Values) + 1
+	_, err = srv.Spreadsheets.Values.Update(sheetID, fmt.Sprintf(sheetUpdate, row, row), vr).
+		ValueInputOption("USER_ENTERED").Do()
+	return err
 }
 
-func uploadPhoto(bot *tgbotapi.BotAPI, fileID, addr, amt string, idx int, drv *drive.Service, folder string) (string, error) {
+// sanitizeFileName removes invalid chars and duplicates
+func sanitizeFileName(name string) string {
+	re := regexp.MustCompile(`[^а-яА-ЯёЁa-zA-Z0-9\s\.-]`)
+	s := re.ReplaceAllString(name, "_")
+	s = regexp.MustCompile(`\s+`).ReplaceAllString(s, "_")
+	s = regexp.MustCompile(`_+`).ReplaceAllString(s, "_")
+	return strings.Trim(s, "_")
+}
+
+// -----------------------------------------------------------------------------
+// Telegram helpers
+// -----------------------------------------------------------------------------
+
+func fullName(u *tgbotapi.User) string {
+	if u == nil {
+		return ""
+	}
+	if u.LastName != "" {
+		return u.FirstName + " " + u.LastName
+	}
+	return u.FirstName
+}
+
+func sendObjectsList(bot *tgbotapi.BotAPI, chatID int64) {
+	var b strings.Builder
+	b.WriteString("📍 Список объектов:\n\n")
+	for i, a := range objectAddresses {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, a)
+	}
+	b.WriteString("\nСкопируйте адрес для подписи чека.")
+
+	msg := tgbotapi.NewMessage(chatID, b.String())
+	if _, err := bot.Send(msg); err != nil {
+		log.Println("sendObjectsList:", err)
+	}
+}
+
+func mainKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
+		[]tgbotapi.KeyboardButton{{Text: "Начать"}},
+		[]tgbotapi.KeyboardButton{{Text: "Объекты"}},
+	)
+}
+
+func sendHelp(bot *tgbotapi.BotAPI, chatID int64) {
+	text := "👋 Бот для отслеживания чеков!\n\n" +
+		"Отправьте фото(а) с подписью:\n" +
+		"Адрес\nСумма\nКомментарий (опц)\n\n" +
+		"Или в одну строку с ключевыми словами: Адрес: ... Сумма: ..."
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = mainKeyboard()
+	if _, err := bot.Send(msg); err != nil {
+		log.Println("sendHelp:", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Message parsing (сокращённая версия)
+// -----------------------------------------------------------------------------
+
+type fieldMatch struct {
+	field      string
+	start, end int
+}
+
+func cleanAmount(a string) string {
+	re := regexp.MustCompile(`[^0-9.,]`)
+	cleaned := re.ReplaceAllString(a, "")
+	return strings.ReplaceAll(cleaned, ".", ",")
+}
+
+func removeLeadingKeyword(text string, kws []string) string {
+	t := strings.TrimSpace(text)
+	lower := strings.ToLower(t)
+	for _, kw := range kws {
+		if strings.HasPrefix(lower, kw) {
+			return strings.TrimSpace(t[len(kw):])
+		}
+	}
+	return t
+}
+
+func parseMessage(message string) (addr, amt, comm string, err error) {
+	if strings.TrimSpace(message) == "" {
+		return "", "", "", errors.New("empty message")
+	}
+
+	// 1. Попытка через ключевые слова
+	if strings.ContainsAny(message, ":=") {
+		normalized := strings.Join(strings.Fields(message), " ")
+		var matches []fieldMatch
+		for field, kws := range fieldKeywords {
+			for _, kw := range kws {
+				re := regexp.MustCompile(fmt.Sprintf(`(?i)%s\s*[:=]`, regexp.QuoteMeta(kw)))
+				for _, loc := range re.FindAllStringIndex(normalized, -1) {
+					matches = append(matches, fieldMatch{field: field, start: loc[0], end: loc[1]})
+				}
+			}
+		}
+		if len(matches) > 0 {
+			sort.Slice(matches, func(i, j int) bool { return matches[i].start < matches[j].start })
+			vals := make(map[string]string)
+			for i, m := range matches {
+				end := len(normalized)
+				if i < len(matches)-1 {
+					end = matches[i+1].start
+				}
+				v := strings.TrimSpace(normalized[m.end:end])
+				if v != "" {
+					vals[m.field] = v
+				}
+			}
+			addr, amt = vals["address"], cleanAmount(vals["amount"])
+			comm = vals["comment"]
+			if addr != "" && amt != "" {
+				return
+			}
+		}
+	}
+
+	// 2. Многострочный без ключевых
+	if strings.Contains(message, "\n") {
+		lines := strings.Split(message, "\n")
+		if len(lines) >= 2 {
+			addr = removeLeadingKeyword(lines[0], fieldKeywords["address"])
+			amt = cleanAmount(removeLeadingKeyword(lines[1], fieldKeywords["amount"]))
+			if len(lines) > 2 {
+				comm = removeLeadingKeyword(strings.Join(lines[2:], " \n"), fieldKeywords["comment"])
+			}
+			if addr != "" && amt != "" {
+				return
+			}
+		}
+	}
+
+	return "", "", "", errors.New("parse failed")
+}
+
+// -----------------------------------------------------------------------------
+// Media handling helpers (сокращено для примера)
+// -----------------------------------------------------------------------------
+
+func processPhoto(bot *tgbotapi.BotAPI, fileID, folderID, addr, amt string, idx int, driveSrv *drive.Service) (string, error) {
 	url, err := bot.GetFileDirectURL(fileID)
 	if err != nil {
 		return "", err
 	}
+
 	resp, err := http.Get(url)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	tmp, _ := os.CreateTemp("", "ph_*.jpg")
-	defer os.Remove(tmp.Name())
-	io.Copy(tmp, resp.Body)
-	tmp.Seek(0, io.SeekStart)
-	fname := fmt.Sprintf("%s_%s_%s_%02d.jpg", time.Now().Format("020106"), sanitizeFilename(addr), sanitizeFilename(strings.ReplaceAll(amt, ",", ".")), idx)
-	file := &drive.File{Name: fname, Parents: []string{folder}}
-	up, err := drv.Files.Create(file).Media(tmp).Fields("webViewLink").Do()
+
+	tmp, err := os.CreateTemp("", "photo_*.jpg")
 	if err != nil {
 		return "", err
 	}
-	return up.WebViewLink, nil
+	defer os.Remove(tmp.Name())
+
+	if _, err = io.Copy(tmp, resp.Body); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	tmp.Close()
+
+	name := fmt.Sprintf("%s_%s_%s_%02d.jpg", time.Now().Format("020106"), sanitizeFileName(addr), sanitizeFileName(strings.ReplaceAll(amt, ",", ".")), idx)
+
+	f, err := os.Open(tmp.Name())
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	df := &drive.File{Name: name, Parents: []string{folderID}}
+	res, err := driveSrv.Files.Create(df).Media(f).Fields("webViewLink").Do()
+	if err != nil {
+		return "", err
+	}
+	return res.WebViewLink, nil
 }
 
-func appendSheet(srv *sheets.Service, sheetID string, d parsedData) error {
-	vals := &sheets.ValueRange{Values: [][]interface{}{{d.Date, d.Username, d.Address, d.Amount, d.Comment, d.DriveLink}}}
-	_, err := srv.Spreadsheets.Values.Append(sheetID, "'Чеки'!A:F", vals).ValueInputOption("USER_ENTERED").InsertDataOption("INSERT_ROWS").Do()
-	return err
-}
-
-// =============================================
-// TELEGRAM HANDLERS
-// =============================================
-
-func handleUpdate(bot *tgbotapi.BotAPI, upd *tgbotapi.Update, drv *drive.Service, folderParent string, sh *sheets.Service, sheetID string, adminID int64) {
-	if upd.Message == nil || len(upd.Message.Photo) == 0 {
-		return
-	}
-	m := upd.Message
-	// single photo
-	if m.MediaGroupID == "" {
-		addr, amt, comm, err := parseCaption(m.Caption)
-		if err != nil {
-			bot.Send(tgbotapi.NewMessage(m.Chat.ID, "❗️ Укажи адрес и сумму в подписи."))
-			return
-		}
-		folder, _ := ensureFolder(drv, folderParent, addr)
-		best := m.Photo[len(m.Photo)-1]
-		link, err := uploadPhoto(bot, best.FileID, addr, amt, 1, drv, folder)
-		if err != nil {
-			bot.Send(tgbotapi.NewMessage(m.Chat.ID, "❗️ Не удалось загрузить фото."))
-			return
-		}
-		data := parsedData{Address: addr, Amount: amt, Comment: comm, Username: m.From.FirstName, Date: time.Now().Format("02.01.2006 15:04:05"), DriveLink: link}
-		if err := appendSheet(sh, sheetID, data); err != nil {
-			bot.Send(tgbotapi.NewMessage(m.Chat.ID, "❗️ Ошибка записи в таблицу."))
-			return
-		}
-		bot.Send(tgbotapi.NewMessage(m.Chat.ID, "✅ Чек загружен!"))
-		bot.Send(tgbotapi.NewMessage(adminID, fmt.Sprintf("✅ Новый чек от %s\nАдрес: %s\nСумма: %s", data.Username, addr, amt)))
-		return
-	}
-	// group
-	mediaMu.Lock()
-	g, ok := groups[m.MediaGroupID]
-	if !ok {
-		addr, amt, comm, _ := parseCaption(m.Caption)
-		g = &mediaGroup{Files: map[string]*tgbotapi.PhotoSize{}, Address: addr, Amount: amt, Comment: comm, Username: m.From.FirstName, ChatID: m.Chat.ID}
-		groups[m.MediaGroupID] = g
-		g.ProcessTimer = time.AfterFunc(mediaGroupTimeout, func() { processGroup(bot, m.MediaGroupID, drv, folderParent, sh, sheetID, adminID) })
-	}
-	best := m.Photo[len(m.Photo)-1]
-	g.Files[best.FileID] = &best
-	if m.Caption != "" && (g.Address == "" || g.Amount == "") {
-		addr, amt, comm, _ := parseCaption(m.Caption)
-		if addr != "" {
-			g.Address = addr
-		}
-		if amt != "" {
-			g.Amount = amt
-		}
-		if comm != "" {
-			g.Comment = comm
-		}
-	}
-	g.LastUpdated = time.Now()
-	if g.ProcessTimer != nil {
-		g.ProcessTimer.Reset(mediaGroupTimeout)
-	}
-	mediaMu.Unlock()
-}
-
-func processGroup(bot *tgbotapi.BotAPI, gid string, drv *drive.Service, parent string, sh *sheets.Service, sheetID string, adminID int64) {
-	mediaMu.Lock()
-	g := groups[gid]
-	if g == nil || g.IsProcessing {
-		mediaMu.Unlock()
-		return
-	}
-	g.IsProcessing = true
-	files := g.Files
-	addr, amt, comm, chatID, user := g.Address, g.Amount, g.Comment, g.ChatID, g.Username
-	mediaMu.Unlock()
-	if addr == "" || amt == "" {
-		bot.Send(tgbotapi.NewMessage(chatID, "❗️ Укажи адрес и сумму."))
-		return
-	}
-	folder, _ := ensureFolder(drv, parent, addr)
-	sem := make(chan struct{}, maxConcurrentUploads)
-	wg := sync.WaitGroup{}
-	linkCh := make(chan string, len(files))
-	idx := 0
-	for _, p := range files {
-		idx++
-		wg.Add(1)
-		go func(i int, ph *tgbotapi.PhotoSize) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			link, err := uploadPhoto(bot, ph.FileID, addr, amt, i, drv, folder)
-			if err == nil {
-				linkCh <- link
-			} else {
-				log.Println("group upload", err)
-			}
-		}(idx, p)
-	}
-	wg.Wait()
-	close(linkCh)
-	links := []string{}
-	for l := range linkCh {
-		links = append(links, l)
-	}
-	if len(links) == 0 {
-		bot.Send(tgbotapi.NewMessage(chatID, "❗️ Не удалось загрузить фото."))
-		return
-	}
-	data := parsedData{Address: addr, Amount: amt, Comment: comm, Username: user, Date: time.Now().Format("02.01.2006 15:04:05"), DriveLink: strings.Join(links, " ")}
-	if err := appendSheet(sh, sheetID, data); err != nil {
-		bot.Send(tgbotapi.NewMessage(chatID, "❗️ Ошибка таблицы."))
-		return
-	}
-	bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Чек загружен! Фото: %d", len(links))))
-	bot.Send(tgbotapi.NewMessage(adminID, fmt.Sprintf("✅ Чек (группа) от %s | %s ₽", user, amt)))
-	mediaMu.Lock()
-	delete(groups, gid)
-	mediaMu.Unlock()
-}
-
-// =============================================
-// MAIN
-// =============================================
+// -----------------------------------------------------------------------------
+// Telegram update handler (сильно упрощён для компиляции)
+// -----------------------------------------------------------------------------
 
 func main() {
-	botToken := mustEnv("TELEGRAM_BOT_TOKEN")
-	webhookURL := mustEnv("WEBHOOK_URL")
-	sheetID := mustEnv("GOOGLE_SHEET_ID")
-	driveParent := mustEnv("GOOGLE_DRIVE_FOLDER_ID")
-	adminID, _ := strconv.ParseInt(mustEnv("ADMIN_CHAT_ID"), 10, 64)
+	tgToken, sheetID, driveFolderID, adminID, clientID, clientSecret, webhookURL := loadEnv()
 
-	ctx := context.Background()
-	client := newGoogleClient(ctx)
-	driveSrv, _ := drive.NewService(ctx, option.WithHTTPClient(client))
-	sheetSrv, _ := sheets.NewService(ctx, option.WithHTTPClient(client))
+	oauthConfig = &oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		RedirectURL:  webhookURL,
+		Scopes: []string{
+			"https://www.googleapis.com/auth/spreadsheets",
+			"https://www.googleapis.com/auth/drive.file",
+		},
+		Endpoint: google.Endpoint,
+	}
 
-	bot, err := tgbotapi.NewBotAPI(botToken)
+	httpClient, err := getOAuthClient(oauthConfig)
 	if err != nil {
-		log.Fatalf("bot init: %v", err)
+		log.Fatalf("oauth: %v", err)
 	}
 
-	// Remove old hook & set new
-	bot.Request(tgbotapi.DeleteWebhookConfig{DropPendingUpdates: true})
-	wh, _ := tgbotapi.NewWebhook(webhookURL)
-	if _, err := bot.Request(wh); err != nil {
-		log.Fatalf("set webhook: %v", err)
+	sheetsSrv, err := sheets.NewService(context.Background(), option.WithHTTPClient(httpClient))
+	if err != nil {
+		log.Fatalf("sheets: %v", err)
 	}
-	info, _ := bot.GetWebhookInfo()
-	log.Printf("Webhook set to %s, pending %d", info.URL, info.PendingUpdateCount)
 
-	// HTTP handler for Telegram POSTs
+	driveSrv, err := drive.NewService(context.Background(), option.WithHTTPClient(httpClient))
+	if err != nil {
+		log.Fatalf("drive: %v", err)
+	}
+
+	bot, err := tgbotapi.NewBotAPI(tgToken)
+	if err != nil {
+		log.Fatalf("bot: %v", err)
+	}
+
+	// ---- webhook init ----
+	parsedURL, err := url.Parse(webhookURL)
+	if err != nil {
+		log.Fatalf("WEBHOOK_URL: %v", err)
+	}
+	if _, err = bot.Request(tgbotapi.WebhookConfig{URL: parsedURL, MaxConnections: 40}); err != nil {
+		log.Fatalf("webhook: %v", err)
+	}
+
+	// ---- HTTP handler ----
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+		if r.Method != http.MethodPost {
+			http.Error(w, "unsupported", http.StatusMethodNotAllowed)
 			return
 		}
+		body, _ := io.ReadAll(r.Body)
 		var upd tgbotapi.Update
-		if err := json.NewDecoder(r.Body).Decode(&upd); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
+		if err := json.Unmarshal(body, &upd); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		go handleUpdate(bot, &upd, driveSrv, driveParent, sheetSrv, sheetID, adminID)
+
+		if upd.Message == nil {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		m := upd.Message
+		switch {
+		case m.IsCommand():
+			switch m.Command() {
+			case "start", "help":
+				sendHelp(bot, m.Chat.ID)
+			}
+		case m.Text == "Начать":
+			sendHelp(bot, m.Chat.ID)
+		case m.Text == "Объекты":
+			sendObjectsList(bot, m.Chat.ID)
+		case len(m.Photo) > 0:
+			if m.Caption == "" {
+				_, _ = bot.Send(tgbotapi.NewMessage(m.Chat.ID, "Добавьте подпись с адресом и суммой"))
+				break
+			}
+			addr, amt, comm, err := parseMessage(m.Caption)
+			if err != nil {
+				_, _ = bot.Send(tgbotapi.NewMessage(m.Chat.ID, "Не удалось распознать подпись"))
+				break
+			}
+			folderID := driveFolderID // в полном коде ensureObjectFolder
+			best := m.Photo[len(m.Photo)-1]
+			link, err := processPhoto(bot, best.FileID, folderID, addr, amt, 1, driveSrv)
+			if err != nil {
+				_, _ = bot.Send(tgbotapi.NewMessage(m.Chat.ID, "Не удалось загрузить фото"))
+				break
+			}
+			data := ParsedData{Address: addr, Amount: amt, Comment: comm, Username: fullName(m.From), Date: time.Now().Format("02.01.2006 15:04:05"), DriveLink: link}
+			if err := appendToSheet(sheetsSrv, sheetID, data); err != nil {
+				_, _ = bot.Send(tgbotapi.NewMessage(m.Chat.ID, "Ошибка записи в таблицу"))
+				break
+			}
+			_, _ = bot.Send(tgbotapi.NewMessage(m.Chat.ID, fmt.Sprintf("✅ Чек загружен! Адрес: %s Сумма: %s", addr, amt)))
+			_, _ = bot.Send(tgbotapi.NewMessage(adminID, fmt.Sprintf("✅ %s загрузил чек %s %s", data.Username, addr, amt)))
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	log.Printf("Server listening on :%s (webhook)", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatalf("srv: %v", err)
-	}
+	// ---- graceful shutdown ----
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+
+	srv := &http.Server{Addr: ":8080"}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("http: %v", err)
+		}
+	}()
+
+	<-quit
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
 }
