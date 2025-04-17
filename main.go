@@ -2,17 +2,14 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,212 +17,199 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
 	"google.golang.org/api/sheets/v4"
 )
 
-// -----------------------------------------------------------------------------
-// Константы и глобальные переменные
-// -----------------------------------------------------------------------------
-
-const (
-	maxRetries           = 3
-	retryDelay           = 2
-	maxConcurrentUploads = 10
-
-	sheetIDRange = "'Чеки'!B:B"
-	sheetUpdate  = "'Чеки'!B%d:G%d"
-
-	// OAuth / env
-	tokenEnvName = "GOOGLE_OAUTH_REFRESH_TOKEN"
-)
-
-var (
-	// Ключевые слова для парсинга подписей
-	fieldKeywords = map[string][]string{
-		"address": {"адрес", "объект", "квартира", "школа", "дом", "улица", "место", "локация"},
-		"amount":  {"сумма", "стоимость", "оплата", "платёж", "цена"},
-		"comment": {"комментарий", "коммент", "прим", "примечание", "дополнение", "заметка"},
-	}
-
-	tokenMu     sync.Mutex
-	oauthConfig *oauth2.Config
-	oauthState  = "state-token"
-	authCodeCh  = make(chan string)
-
-	mediaGroupCache   = make(map[string]*MediaGroupData)
-	mediaGroupMu      sync.Mutex
-	mediaGroupTimeout = 3 * time.Second
-)
-
-// Список объектов для кнопки «Объекты»
-var objectAddresses = []string{
-	"Афанасьево 1",
-	"Афанасьево 2",
-	"Каскад 1",
-	"Каскад 2",
-	"Тимирязева 3",
-	"Ковернино",
-	"Комсомольская",
-	"Город Времени",
-	"Крутая",
-	"Малая Ельня",
-	"Тимирязева 9",
-	"Анкудиновское шоссе 47",
-	"Советской Армии",
-	"Волоколамское шоссе",
-	"Долгопрудненское шоссе 3",
+// --- Конфигурация приложения ---
+type Config struct {
+	TelegramToken         string
+	AdminChatID           int64
+	SheetsID              string
+	DriveFolderID         string
+	WebhookURL            string
+	Port                  string
+	GoogleCredentialsJSON string
 }
 
-// -----------------------------------------------------------------------------
-// Типы
-// -----------------------------------------------------------------------------
-
-type ParsedData struct {
-	Address, Amount, Comment, Username, Date, DriveLink string
-}
-
-type MediaGroupData struct {
-	Files            map[string]*tgbotapi.PhotoSize
-	Caption          string
-	Address          string
-	Amount           string
-	Comment          string
-	FirstMessageTime time.Time
-	LastUpdated      time.Time
-	UserID           int64
-	ChatID           int64
-	Username         string
-	IsProcessing     bool
-	timer            *time.Timer
-}
-
-// -----------------------------------------------------------------------------
-// Вспомогательные функции
-// -----------------------------------------------------------------------------
-
-func mandatory(key string) string {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		log.Fatalf("env %s not set", key)
-	}
-	return v
-}
-
-func loadEnv() (tgToken, sheetID, driveFolderID string, adminID int64, clientID, clientSecret, webhookURL string) {
-	tgToken = mandatory("TELEGRAM_BOT_TOKEN")
-	sheetID = mandatory("GOOGLE_SHEET_ID")
-	driveFolderID = mandatory("GOOGLE_DRIVE_FOLDER_ID")
-	clientID = mandatory("GOOGLE_OAUTH_CLIENT_ID")
-	clientSecret = mandatory("GOOGLE_OAUTH_CLIENT_SECRET")
-	webhookURL = mandatory("WEBHOOK_URL")
-	adminStr := mandatory("ADMIN_CHAT_ID")
-
-	id, err := strconv.ParseInt(adminStr, 10, 64)
+// Загружает настройки из переменных окружения
+func loadConfig() (*Config, error) {
+	adminID, err := strconv.ParseInt(os.Getenv("ADMIN_CHAT_ID"), 10, 64)
 	if err != nil {
-		log.Fatalf("invalid ADMIN_CHAT_ID: %v", err)
+		return nil, fmt.Errorf("ADMIN_CHAT_ID: %w", err)
 	}
-	adminID = id
-	return
+	cfg := &Config{
+		TelegramToken:         os.Getenv("TELEGRAM_BOT_TOKEN"),
+		AdminChatID:           adminID,
+		SheetsID:              os.Getenv("GOOGLE_SHEET_ID"),
+		DriveFolderID:         os.Getenv("GOOGLE_DRIVE_FOLDER_ID"),
+		WebhookURL:            os.Getenv("WEBHOOK_URL"),
+		Port:                  os.Getenv("PORT"),
+		GoogleCredentialsJSON: os.Getenv("GOOGLE_CREDENTIALS_JSON"),
+	}
+	if cfg.TelegramToken == "" || cfg.SheetsID == "" || cfg.DriveFolderID == "" || cfg.WebhookURL == "" || cfg.GoogleCredentialsJSON == "" {
+		return nil, errors.New("one or more required environment variables are missing")
+	}
+	if cfg.Port == "" {
+		cfg.Port = "8080"
+	}
+	return cfg, nil
 }
 
-// -----------------------------------------------------------------------------
-// OAuth helpers
-// -----------------------------------------------------------------------------
-
-func refreshTokenFromEnv() (*oauth2.Token, error) {
-	tok := os.Getenv(tokenEnvName)
-	if tok == "" {
-		return nil, errors.New("refresh token env not set")
-	}
-	return &oauth2.Token{RefreshToken: tok}, nil
+// --- Утилиты парсинга сообщений ---
+var keywords = map[string]*regexp.Regexp{
+	"address": regexp.MustCompile(`(?i)адрес[:\s-]*(.+)`),
+	"amount":  regexp.MustCompile(`(?i)сумма[:\s-]*(.+)`),
+	"comment": regexp.MustCompile(`(?i)комментари?й?[:\s-]*(.+)`),
 }
 
-func getOAuthClient(cfg *oauth2.Config) (*http.Client, error) {
-	tokenMu.Lock()
-	defer tokenMu.Unlock()
-
-	if rt, err := refreshTokenFromEnv(); err == nil {
-		// Есть refresh‑token — пытаемся обновить access‑token
-		ts := cfg.TokenSource(context.Background(), rt)
-		if t, err := ts.Token(); err == nil {
-			return cfg.Client(context.Background(), t), nil
+func parseCaption(text string) (address, amount, comment string, err error) {
+	for key, re := range keywords {
+		if m := re.FindStringSubmatch(text); len(m) > 1 {
+			switch key {
+			case "address":
+				address = strings.TrimSpace(m[1])
+			case "amount":
+				amount = cleanNumber(m[1])
+			case "comment":
+				comment = strings.TrimSpace(m[1])
+			}
 		}
 	}
-
-	// Запускаем локальный сервер для получения auth‑code
-	srv := &http.Server{Addr: ":8080"}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("state") != oauthState {
-			http.Error(w, "state mismatch", http.StatusBadRequest)
-			return
-		}
-		code := r.URL.Query().Get("code")
-		if code == "" {
-			http.Error(w, "code not found", http.StatusBadRequest)
-			return
-		}
-		fmt.Fprintln(w, "Auth OK. Return to console.")
-		authCodeCh <- code
-	})
-	srv.Handler = mux
-	go func() {
-		_ = srv.ListenAndServe()
-	}()
-
-	fmt.Println("Open", cfg.AuthCodeURL(oauthState, oauth2.AccessTypeOffline))
-
-	select {
-	case code := <-authCodeCh:
-		_ = srv.Shutdown(context.Background())
-		tok, err := cfg.Exchange(context.Background(), code)
-		if err != nil {
-			return nil, err
-		}
-		fmt.Printf("New refresh‑token → set %s env: %s\n", tokenEnvName, tok.RefreshToken)
-		return cfg.Client(context.Background(), tok), nil
-	case <-time.After(5 * time.Minute):
-		_ = srv.Shutdown(context.Background())
-		return nil, errors.New("oauth timeout")
+	if address == "" || amount == "" {
+		return "", "", "", errors.New("не найдены обязательные поля адрес или сумма")
 	}
+	return address, amount, comment, nil
 }
 
-// -----------------------------------------------------------------------------
-// Drive / Sheets helpers
-// -----------------------------------------------------------------------------
+func cleanNumber(s string) string {
+	re := regexp.MustCompile(`[^0-9.,]`)
+	s = re.ReplaceAllString(s, "")
+	s = strings.ReplaceAll(s, ",", ".")
+	return s
+}
 
-func appendToSheet(srv *sheets.Service, sheetID string, data ParsedData) error {
-	values := []interface{}{data.Date, data.Username, data.Address, data.Amount, data.Comment, data.DriveLink}
-	vr := &sheets.ValueRange{Values: [][]interface{}{values}}
+func sanitizeFileName(s string) string {
+	re := regexp.MustCompile(`[^a-zA-Z0-9._-]`)
+	s = re.ReplaceAllString(s, "_")
+	return s
+}
 
-	resp, err := srv.Spreadsheets.Values.Get(sheetID, sheetIDRange).Do()
+// --- Google API: Sheets и Drive ---
+func newGoogleServices(ctx context.Context, credsJSON string) (*sheets.Service, *drive.Service, error) {
+	creds, err := google.CredentialsFromJSON(ctx, []byte(credsJSON),
+		"https://www.googleapis.com/auth/spreadsheets",
+		"https://www.googleapis.com/auth/drive.file",
+	)
 	if err != nil {
-		return err
+		return nil, nil, fmt.Errorf("credentials: %w", err)
 	}
-	row := len(resp.Values) + 1
-	_, err = srv.Spreadsheets.Values.Update(sheetID, fmt.Sprintf(sheetUpdate, row, row), vr).
-		ValueInputOption("USER_ENTERED").Do()
-	return err
+	sheetsSrv, err := sheets.NewService(ctx, option.WithCredentials(creds))
+	if err != nil {
+		return nil, nil, fmt.Errorf("sheets service: %w", err)
+	}
+	driveSrv, err := drive.NewService(ctx, option.WithCredentials(creds))
+	if err != nil {
+		return nil, nil, fmt.Errorf("drive service: %w", err)
+	}
+	return sheetsSrv, driveSrv, nil
 }
 
-// sanitizeFileName removes invalid chars and duplicates
-func sanitizeFileName(name string) string {
-	re := regexp.MustCompile(`[^а-яА-ЯёЁa-zA-Z0-9\s\.-]`)
-	s := re.ReplaceAllString(name, "_")
-	s = regexp.MustCompile(`\s+`).ReplaceAllString(s, "_")
-	s = regexp.MustCompile(`_+`).ReplaceAllString(s, "_")
-	return strings.Trim(s, "_")
+func uploadToDrive(ctx context.Context, svc *drive.Service, folderID, fileName string, reader io.Reader) (string, error) {
+	file := &drive.File{Name: fileName, Parents: []string{folderID}}
+	res, err := svc.Files.Create(file).Media(reader).Fields("webViewLink").Context(ctx).Do()
+	if err != nil {
+		return "", fmt.Errorf("drive upload: %w", err)
+	}
+	return res.WebViewLink, nil
 }
 
-// -----------------------------------------------------------------------------
-// Telegram helpers
-// -----------------------------------------------------------------------------
+func appendToSheet(ctx context.Context, svc *sheets.Service, sheetID string, row []interface{}) error {
+	rangeA1 := "'Чеки'!B:G"
+	vr := &sheets.ValueRange{Values: [][]interface{}{row}}
+	_, err := svc.Spreadsheets.Values.Append(sheetID, rangeA1, vr).
+		ValueInputOption("USER_ENTERED").InsertDataOption("INSERT_ROWS").Context(ctx).
+		Do()
+	if err != nil {
+		return fmt.Errorf("sheets append: %w", err)
+	}
+	return nil
+}
 
-func fullName(u *tgbotapi.User) string {
+// --- Обработка обновлений Telegram ---
+func handleUpdate(ctx context.Context, bot *tgbotapi.BotAPI, sheetsSrv *sheets.Service, driveSrv *drive.Service, cfg *Config, update tgbotapi.Update) {
+	msg := update.Message
+	if msg == nil {
+		return
+	}
+
+	if msg.IsCommand() {
+		handleCommand(bot, cfg.AdminChatID, msg)
+		return
+	}
+
+	if len(msg.Photo) == 0 || msg.Caption == "" {
+		reply := tgbotapi.NewMessage(msg.Chat.ID, "📌 Отправьте фото чека с подписью: Адрес, Сумма, Комментарий (необязательно)")
+		bot.Send(reply)
+		return
+	}
+
+	address, amount, comment, err := parseCaption(msg.Caption)
+	if err != nil {
+		reply := tgbotapi.NewMessage(msg.Chat.ID, "❗ Ошибка формата подписи. Используйте /help для инструкции.")
+		bot.Send(reply)
+		return
+	}
+
+	// Скачиваем и загружаем фото
+	file := msg.Photo[len(msg.Photo)-1]
+	f, err := bot.GetFile(tgbotapi.FileConfig{FileID: file.FileID})
+	if err != nil {
+		log.Printf("get file: %v", err)
+		return
+	}
+	fileURL := f.Link(bot.Token)
+	res, err := http.Get(fileURL)
+	if err != nil {
+		log.Printf("download photo: %v", err)
+		return
+	}
+	defer res.Body.Close()
+
+	timestamp := time.Unix(int64(msg.Date), 0).Format("20060102_15-04-05")
+	fileName := fmt.Sprintf("%s_%s.jpg", sanitizeFileName(address), timestamp)
+
+	driveLink, err := uploadToDrive(ctx, driveSrv, cfg.DriveFolderID, fileName, res.Body)
+	if err != nil {
+		log.Printf("upload drive: %v", err)
+		return
+	}
+
+	row := []interface{}{time.Now().Format("02.01.2006 15:04:05"), getFullName(msg.From), address, amount, comment, driveLink}
+	err = appendToSheet(ctx, sheetsSrv, cfg.SheetsID, row)
+	if err != nil {
+		log.Printf("append sheet: %v", err)
+		return
+	}
+
+	bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "✅ Чек добавлен!"))
+}
+
+func handleCommand(bot *tgbotapi.BotAPI, adminID int64, msg *tgbotapi.Message) {
+	switch msg.Command() {
+	case "start", "help":
+		help := "🤖 Бот учёта чеков\n\n" +
+			"Отправьте фото чека с подписью:\n" +
+			"Адрес: ...\nСумма: ...\nКомментарий: ...(опционально)"
+		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, help))
+	default:
+		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❓ Неизвестная команда. Используйте /help."))
+	}
+}
+
+func getFullName(u *tgbotapi.User) string {
 	if u == nil {
 		return ""
 	}
@@ -235,282 +219,66 @@ func fullName(u *tgbotapi.User) string {
 	return u.FirstName
 }
 
-func sendObjectsList(bot *tgbotapi.BotAPI, chatID int64) {
-	var b strings.Builder
-	b.WriteString("📍 Список объектов:\n\n")
-	for i, a := range objectAddresses {
-		fmt.Fprintf(&b, "%d. %s\n", i+1, a)
-	}
-	b.WriteString("\nСкопируйте адрес для подписи чека.")
-
-	msg := tgbotapi.NewMessage(chatID, b.String())
-	if _, err := bot.Send(msg); err != nil {
-		log.Println("sendObjectsList:", err)
-	}
-}
-
-func mainKeyboard() tgbotapi.ReplyKeyboardMarkup {
-	return tgbotapi.NewReplyKeyboard(
-		[]tgbotapi.KeyboardButton{{Text: "Начать"}},
-		[]tgbotapi.KeyboardButton{{Text: "Объекты"}},
-	)
-}
-
-func sendHelp(bot *tgbotapi.BotAPI, chatID int64) {
-	text := "👋 Бот для отслеживания чеков!\n\n" +
-		"Отправьте фото(а) с подписью:\n" +
-		"Адрес\nСумма\nКомментарий (опц)\n\n" +
-		"Или в одну строку с ключевыми словами: Адрес: ... Сумма: ..."
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ReplyMarkup = mainKeyboard()
-	if _, err := bot.Send(msg); err != nil {
-		log.Println("sendHelp:", err)
-	}
-}
-
-// -----------------------------------------------------------------------------
-// Message parsing (сокращённая версия)
-// -----------------------------------------------------------------------------
-
-type fieldMatch struct {
-	field      string
-	start, end int
-}
-
-func cleanAmount(a string) string {
-	re := regexp.MustCompile(`[^0-9.,]`)
-	cleaned := re.ReplaceAllString(a, "")
-	return strings.ReplaceAll(cleaned, ".", ",")
-}
-
-func removeLeadingKeyword(text string, kws []string) string {
-	t := strings.TrimSpace(text)
-	lower := strings.ToLower(t)
-	for _, kw := range kws {
-		if strings.HasPrefix(lower, kw) {
-			return strings.TrimSpace(t[len(kw):])
-		}
-	}
-	return t
-}
-
-func parseMessage(message string) (addr, amt, comm string, err error) {
-	if strings.TrimSpace(message) == "" {
-		return "", "", "", errors.New("empty message")
-	}
-
-	// 1. Попытка через ключевые слова
-	if strings.ContainsAny(message, ":=") {
-		normalized := strings.Join(strings.Fields(message), " ")
-		var matches []fieldMatch
-		for field, kws := range fieldKeywords {
-			for _, kw := range kws {
-				re := regexp.MustCompile(fmt.Sprintf(`(?i)%s\s*[:=]`, regexp.QuoteMeta(kw)))
-				for _, loc := range re.FindAllStringIndex(normalized, -1) {
-					matches = append(matches, fieldMatch{field: field, start: loc[0], end: loc[1]})
-				}
-			}
-		}
-		if len(matches) > 0 {
-			sort.Slice(matches, func(i, j int) bool { return matches[i].start < matches[j].start })
-			vals := make(map[string]string)
-			for i, m := range matches {
-				end := len(normalized)
-				if i < len(matches)-1 {
-					end = matches[i+1].start
-				}
-				v := strings.TrimSpace(normalized[m.end:end])
-				if v != "" {
-					vals[m.field] = v
-				}
-			}
-			addr, amt = vals["address"], cleanAmount(vals["amount"])
-			comm = vals["comment"]
-			if addr != "" && amt != "" {
-				return
-			}
-		}
-	}
-
-	// 2. Многострочный без ключевых
-	if strings.Contains(message, "\n") {
-		lines := strings.Split(message, "\n")
-		if len(lines) >= 2 {
-			addr = removeLeadingKeyword(lines[0], fieldKeywords["address"])
-			amt = cleanAmount(removeLeadingKeyword(lines[1], fieldKeywords["amount"]))
-			if len(lines) > 2 {
-				comm = removeLeadingKeyword(strings.Join(lines[2:], " \n"), fieldKeywords["comment"])
-			}
-			if addr != "" && amt != "" {
-				return
-			}
-		}
-	}
-
-	return "", "", "", errors.New("parse failed")
-}
-
-// -----------------------------------------------------------------------------
-// Media handling helpers (сокращено для примера)
-// -----------------------------------------------------------------------------
-
-func processPhoto(bot *tgbotapi.BotAPI, fileID, folderID, addr, amt string, idx int, driveSrv *drive.Service) (string, error) {
-	url, err := bot.GetFileDirectURL(fileID)
-	if err != nil {
-		return "", err
-	}
-
-	resp, err := http.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	tmp, err := os.CreateTemp("", "photo_*.jpg")
-	if err != nil {
-		return "", err
-	}
-	defer os.Remove(tmp.Name())
-
-	if _, err = io.Copy(tmp, resp.Body); err != nil {
-		tmp.Close()
-		return "", err
-	}
-	tmp.Close()
-
-	name := fmt.Sprintf("%s_%s_%s_%02d.jpg", time.Now().Format("020106"), sanitizeFileName(addr), sanitizeFileName(strings.ReplaceAll(amt, ",", ".")), idx)
-
-	f, err := os.Open(tmp.Name())
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	df := &drive.File{Name: name, Parents: []string{folderID}}
-	res, err := driveSrv.Files.Create(df).Media(f).Fields("webViewLink").Do()
-	if err != nil {
-		return "", err
-	}
-	return res.WebViewLink, nil
-}
-
-// -----------------------------------------------------------------------------
-// Telegram update handler (сильно упрощён для компиляции)
-// -----------------------------------------------------------------------------
-
 func main() {
-	tgToken, sheetID, driveFolderID, adminID, clientID, clientSecret, webhookURL := loadEnv()
-
-	oauthConfig = &oauth2.Config{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		RedirectURL:  webhookURL,
-		Scopes: []string{
-			"https://www.googleapis.com/auth/spreadsheets",
-			"https://www.googleapis.com/auth/drive.file",
-		},
-		Endpoint: google.Endpoint,
-	}
-
-	httpClient, err := getOAuthClient(oauthConfig)
+	ctx := context.Background()
+	cfg, err := loadConfig()
 	if err != nil {
-		log.Fatalf("oauth: %v", err)
+		log.Fatalf("config: %v", err)
 	}
 
-	sheetsSrv, err := sheets.NewService(context.Background(), option.WithHTTPClient(httpClient))
+	sheetsSrv, driveSrv, err := newGoogleServices(ctx, cfg.GoogleCredentialsJSON)
 	if err != nil {
-		log.Fatalf("sheets: %v", err)
+		log.Fatalf("google services: %v", err)
 	}
 
-	driveSrv, err := drive.NewService(context.Background(), option.WithHTTPClient(httpClient))
+	bot, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
 	if err != nil {
-		log.Fatalf("drive: %v", err)
+		log.Fatalf("telegram bot: %v", err)
 	}
+	bot.Debug = false
 
-	bot, err := tgbotapi.NewBotAPI(tgToken)
+	// Настройка webhook
+	// Настройка webhook
+	hook, err := tgbotapi.NewWebhook(cfg.WebhookURL + "/" + bot.Token)
 	if err != nil {
-		log.Fatalf("bot: %v", err)
+		log.Fatalf("new webhook: %v", err)
 	}
+	hook.MaxConnections = 40
 
-	// ---- webhook init ----
-	parsedURL, err := url.Parse(webhookURL)
+	_, err = bot.Request(hook)
 	if err != nil {
-		log.Fatalf("WEBHOOK_URL: %v", err)
-	}
-	if _, err = bot.Request(tgbotapi.WebhookConfig{URL: parsedURL, MaxConnections: 40}); err != nil {
-		log.Fatalf("webhook: %v", err)
+		log.Fatalf("set webhook: %v", err)
 	}
 
-	// ---- HTTP handler ----
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "unsupported", http.StatusMethodNotAllowed)
-			return
-		}
-		body, _ := io.ReadAll(r.Body)
-		var upd tgbotapi.Update
-		if err := json.Unmarshal(body, &upd); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
+	// Получаем канал обновлений по webhook
+	updates := bot.ListenForWebhook("/" + bot.Token)
 
-		if upd.Message == nil {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		m := upd.Message
-		switch {
-		case m.IsCommand():
-			switch m.Command() {
-			case "start", "help":
-				sendHelp(bot, m.Chat.ID)
-			}
-		case m.Text == "Начать":
-			sendHelp(bot, m.Chat.ID)
-		case m.Text == "Объекты":
-			sendObjectsList(bot, m.Chat.ID)
-		case len(m.Photo) > 0:
-			if m.Caption == "" {
-				_, _ = bot.Send(tgbotapi.NewMessage(m.Chat.ID, "Добавьте подпись с адресом и суммой"))
-				break
-			}
-			addr, amt, comm, err := parseMessage(m.Caption)
-			if err != nil {
-				_, _ = bot.Send(tgbotapi.NewMessage(m.Chat.ID, "Не удалось распознать подпись"))
-				break
-			}
-			folderID := driveFolderID // в полном коде ensureObjectFolder
-			best := m.Photo[len(m.Photo)-1]
-			link, err := processPhoto(bot, best.FileID, folderID, addr, amt, 1, driveSrv)
-			if err != nil {
-				_, _ = bot.Send(tgbotapi.NewMessage(m.Chat.ID, "Не удалось загрузить фото"))
-				break
-			}
-			data := ParsedData{Address: addr, Amount: amt, Comment: comm, Username: fullName(m.From), Date: time.Now().Format("02.01.2006 15:04:05"), DriveLink: link}
-			if err := appendToSheet(sheetsSrv, sheetID, data); err != nil {
-				_, _ = bot.Send(tgbotapi.NewMessage(m.Chat.ID, "Ошибка записи в таблицу"))
-				break
-			}
-			_, _ = bot.Send(tgbotapi.NewMessage(m.Chat.ID, fmt.Sprintf("✅ Чек загружен! Адрес: %s Сумма: %s", addr, amt)))
-			_, _ = bot.Send(tgbotapi.NewMessage(adminID, fmt.Sprintf("✅ %s загрузил чек %s %s", data.Username, addr, amt)))
-		}
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
 	})
 
-	// ---- graceful shutdown ----
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-
-	srv := &http.Server{Addr: ":8080"}
+	server := &http.Server{Addr: ":" + cfg.Port}
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http: %v", err)
+		log.Printf("Listening on %s", cfg.Port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server: %v", err)
 		}
 	}()
 
-	<-quit
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
+	var wg sync.WaitGroup
+	for update := range updates {
+		wg.Add(1)
+		go func(u tgbotapi.Update) {
+			defer wg.Done()
+			handleUpdate(ctx, bot, sheetsSrv, driveSrv, cfg, u)
+		}(update)
+	}
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	log.Println("Shutting down...")
+	server.Shutdown(ctx)
+	wg.Wait()
 }
