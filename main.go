@@ -35,9 +35,8 @@ const (
 	maxConcurrentUploads  = 10
 	sheetIDRange          = "'Чеки'!B:B"
 	sheetUpdate           = "'Чеки'!B%d:G%d"
-	tokenFile             = "token.json"
 	tokenRefreshThreshold = 30 * time.Minute
-	tokenEnvName          = "GOOGLE_OAUTH_TOKEN" // OAuth-токен можно задать через переменную окружения
+	tokenEnvName          = "GOOGLE_OAUTH_REFRESH_TOKEN" // Используем переменную окружения для refresh token
 	maxTokenRetries       = 5
 )
 
@@ -55,7 +54,6 @@ var (
 	authCodeCh        = make(chan string)
 	mediaGroupCache   = make(map[string]*MediaGroupData)
 )
-
 var objectAddresses = []string{
 	"Афанасьево 1",
 	"Афанасьево 2",
@@ -76,7 +74,6 @@ var objectAddresses = []string{
 type ParsedData struct {
 	Address, Amount, Comment, Username, Date, DriveLink string
 }
-
 type MediaGroupData struct {
 	Files            map[string]*tgbotapi.PhotoSize
 	Caption          string
@@ -91,50 +88,20 @@ type MediaGroupData struct {
 	IsProcessing     bool
 	ProcessTimer     *time.Timer
 }
-
 type fieldMatch struct {
 	field      string
 	start, end int
 }
 
-// --- Функции для работы с токеном ---
-
-// saveTokenToFile сохраняет токен в файл с правами доступа 0600.
-func saveTokenToFile(token *oauth2.Token) error {
-	data, err := json.Marshal(token)
-	if err != nil {
-		return fmt.Errorf("ошибка маршалинга токена: %v", err)
-	}
-	return os.WriteFile(tokenFile, data, 0600)
-}
-
-// loadTokenFromFile пытается загрузить токен из файла.
-func loadTokenFromFile() (*oauth2.Token, error) {
-	data, err := os.ReadFile(tokenFile)
-	if err != nil {
-		return nil, err
-	}
-	var token oauth2.Token
-	if err := json.Unmarshal(data, &token); err != nil {
-		return nil, err
-	}
-	return &token, nil
-}
-
-// loadTokenFromEnv пытается загрузить токен из переменной окружения GOOGLE_OAUTH_TOKEN.
-func loadTokenFromEnv() (*oauth2.Token, error) {
+// loadRefreshTokenFromEnv загружает refresh token из переменной окружения.
+func loadRefreshTokenFromEnv() (string, error) {
 	envVal := os.Getenv(tokenEnvName)
 	if envVal == "" {
-		return nil, errors.New("переменная окружения не установлена")
+		return "", errors.New("переменная окружения не установлена")
 	}
-	var token oauth2.Token
-	if err := json.Unmarshal([]byte(envVal), &token); err != nil {
-		return nil, fmt.Errorf("ошибка маршалинга токена из переменной окружения: %v", err)
-	}
-	return &token, nil
+	return envVal, nil
 }
 
-// loadEnvVars загружает все необходимые переменные окружения.
 func loadEnvVars() (telegramToken, spreadsheetID, driveFolderID string, adminID int64, googleClientID, googleClientSecret, webhookURL string) {
 	telegramToken = os.Getenv("TELEGRAM_BOT_TOKEN")
 	spreadsheetID = os.Getenv("GOOGLE_SHEET_ID")
@@ -155,40 +122,29 @@ func loadEnvVars() (telegramToken, spreadsheetID, driveFolderID string, adminID 
 	return
 }
 
-// getOAuthClient возвращает OAuth HTTP-клиент, пытаясь загрузить токен сначала из файла,
-// затем из переменной окружения. Если токен найден, проверяет его срок действия и обновляет, если нужно.
 func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 	var token *oauth2.Token
 	var err error
 
 	tokenMutex.Lock()
-	token, err = loadTokenFromFile()
-	if err != nil || !token.Valid() {
-		// Если не удалось загрузить из файла, пробуем загрузить из переменной окружения
-		token, err = loadTokenFromEnv()
-		if err != nil {
-			log.Printf("Токен не найден в файле или переменной окружения: %v", err)
-		} else {
-			// Сохраняем токен, полученный из переменной окружения, в файл
-			if err := saveTokenToFile(token); err != nil {
-				log.Printf("Не удалось сохранить токен, полученный из переменной окружения: %v", err)
-			}
-		}
-	}
-	tokenMutex.Unlock()
+	defer tokenMutex.Unlock()
 
-	// Если токен найден и действителен, проверяем срок его истечения
-	if token != nil && token.Valid() {
-		if time.Until(token.Expiry) < tokenRefreshWindow && token.RefreshToken != "" {
-			if newToken, err := refreshToken(config, token); err == nil {
-				_ = saveTokenToFile(newToken)
-				return config.Client(context.Background(), newToken), nil
-			}
+	refreshToken, err := loadRefreshTokenFromEnv()
+	if err == nil && refreshToken != "" {
+		// Попытка обновить токен с использованием refresh token
+		tokenSource := config.TokenSource(context.Background(), &oauth2.Token{RefreshToken: refreshToken})
+		newToken, err := tokenSource.Token()
+		if err == nil {
+			log.Println("Токен успешно обновлен с использованием refresh token.")
+			return config.Client(context.Background(), newToken), nil
 		}
-		return config.Client(context.Background(), token), nil
+		log.Printf("Не удалось обновить токен с использованием refresh token: %v. Требуется повторная авторизация.", err)
+		// Fallback to the full auth flow if refresh fails
+	} else {
+		log.Println("Refresh token не найден в переменной окружения. Требуется авторизация.")
 	}
 
-	// Если токен отсутствует или недействителен, запускаем OAuth-процесс
+	// Запускаем OAuth 2.0 flow, если нет refresh token или обновление не удалось
 	errCh := make(chan error, 1)
 	server := startOAuthServer(errCh)
 	defer func() {
@@ -196,15 +152,17 @@ func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 		defer cancel()
 		server.Shutdown(ctx)
 	}()
-	authURL := config.AuthCodeURL(oauthState, oauth2.AccessTypeOffline, oauth2.ApprovalForce)
-	fmt.Printf("👉 Перейдите по ссылке для авторизации:\n%s\n", authURL)
+	authURL := config.AuthCodeURL(oauthState, oauth2.AccessTypeOffline) // Запрашиваем offline доступ для получения refresh token
+	fmt.Printf("👉 Перейдите по ссылке для авторизации:\n%s\nПосле авторизации скопируйте полученный код и вставьте его в переменную окружения %s в Railway.\n", authURL, tokenEnvName)
+
 	select {
 	case code := <-authCodeCh:
 		token, err := config.Exchange(context.Background(), code)
 		if err != nil {
 			return nil, fmt.Errorf("ошибка обмена кода: %v", err)
 		}
-		_ = saveTokenToFile(token)
+		// Важно: Здесь мы получаем новый refresh token. Его нужно вывести пользователю для установки в переменную окружения.
+		log.Printf("Получен новый refresh token: %s\nПожалуйста, установите эту строку в качестве значения переменной окружения %s в Railway.", token.RefreshToken, tokenEnvName)
 		return config.Client(context.Background(), token), nil
 	case err := <-errCh:
 		return nil, fmt.Errorf("ошибка OAuth сервера: %v", err)
@@ -213,7 +171,6 @@ func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 	}
 }
 
-// startOAuthServer запускает локальный HTTP-сервер для получения OAuth кода.
 func startOAuthServer(errCh chan error) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -226,19 +183,20 @@ func startOAuthServer(errCh chan error) *http.Server {
 			http.Error(w, "Код не найден", http.StatusBadRequest)
 			return
 		}
-		fmt.Fprintln(w, "Авторизация прошла успешно. Закройте окно 😊")
+		fmt.Fprintln(w, "Авторизация прошла успешно. Вы можете закрыть это окно и скопировать код из логов приложения Railway.")
 		authCodeCh <- code
 	})
 	server := &http.Server{Addr: ":8080", Handler: mux}
 	go func() {
+		log.Printf("Запуск OAuth сервера на http://localhost:8080")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
+		log.Println("OAuth сервер остановлен.")
 	}()
 	return server
 }
 
-// refreshToken выполняет обновление OAuth-токена с несколькими попытками.
 func refreshToken(config *oauth2.Config, token *oauth2.Token) (*oauth2.Token, error) {
 	var newToken *oauth2.Token
 	var err error
@@ -254,8 +212,6 @@ func refreshToken(config *oauth2.Config, token *oauth2.Token) (*oauth2.Token, er
 	}
 	return nil, fmt.Errorf("не удалось обновить токен после %d попыток: %v", maxRetries, err)
 }
-
-// --- Функции для обработки фотографий и данных ---
 
 func cleanAmount(amount string) string {
 	re := regexp.MustCompile(`[^0-9.,]`)
@@ -431,8 +387,6 @@ func notifyAdminFailure(bot *tgbotapi.BotAPI, adminID int64, err error, userMsg 
 	adminMsg := tgbotapi.NewMessage(adminID, msgText)
 	bot.Send(adminMsg)
 }
-
-// --- Функции для обработки медиа-групп и одиночных фото ---
 
 func processMediaGroup(bot *tgbotapi.BotAPI, groupID string, sheetsSrv *sheets.Service, sheetID string, driveSrv *drive.Service, parentID string, adminID int64) {
 	mediaGroupCacheMu.Lock()
@@ -622,7 +576,6 @@ func handleSinglePhotoMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, sheet
 	notifyAdminSuccess(bot, adminID, parsedData, msg, folderMsg)
 }
 
-// parseMessage пытается извлечь адрес, сумму и комментарий из подписи.
 func parseMessage(message string) (string, string, string, error) {
 	if strings.TrimSpace(message) == "" {
 		return "", "", "", errors.New("пустое сообщение")
@@ -705,9 +658,6 @@ func fallbackParse(message string) (string, string, string, error) {
 	return removeLeadingKeyword(message, fieldKeywords["address"]), "", "", errors.New("сумма не найдена")
 }
 
-// --- Функции для поддержки работы HTTP-сервера и интерфейса Telegram ---
-
-// keepAlive периодически отправляет GET-запросы по заданному URL для поддержания активности приложения.
 func keepAlive(url string) {
 	ticker := time.NewTicker(15 * time.Minute)
 	go func() {
@@ -802,7 +752,6 @@ func sendHelpMessage(bot *tgbotapi.BotAPI, chatID int64) {
 	}
 }
 
-// setupHandler настраивает HTTP-обработчик для получения Telegram update через webhook
 func setupHandler(bot *tgbotapi.BotAPI, sheetsSrv *sheets.Service, sheetID string, driveSrv *drive.Service, parentID string, adminID int64) {
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
@@ -852,46 +801,38 @@ func setupHandler(bot *tgbotapi.BotAPI, sheetsSrv *sheets.Service, sheetID strin
 }
 
 func main() {
-	// Загрузка переменных окружения
 	telegramToken, sheetID, driveFolderID, adminID, googleClientID, googleClientSecret, webhookURL := loadEnvVars()
-	// Инициализация OAuth-конфигурации Google
 	oauthConfig = &oauth2.Config{
 		ClientID:     googleClientID,
 		ClientSecret: googleClientSecret,
-		RedirectURL:  "https://checkstosheets-production.up.railway.app/",
+		RedirectURL:  webhookURL, // Важно использовать webhook URL для редиректа
 		Scopes: []string{
 			"https://www.googleapis.com/auth/spreadsheets",
 			"https://www.googleapis.com/auth/drive.file",
 		},
 		Endpoint: google.Endpoint,
 	}
-	// Периодическое обновление токена (каждый час)
-	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
-		defer ticker.Stop()
-		for range ticker.C {
-			_, _ = getOAuthClient(oauthConfig)
-		}
-	}()
-	// Получаем OAuth-клиент
+
 	client, err := getOAuthClient(oauthConfig)
 	if err != nil {
 		log.Fatalf("OAuth клиент не получен: %v", err)
 	}
-	// Создание сервисов Google Sheets и Drive
+
 	sheetsSrv, err := sheets.NewService(context.Background(), option.WithHTTPClient(client))
 	if err != nil {
 		log.Fatalf("Sheets сервис не создан: %v", err)
 	}
+
 	driveSrv, err := drive.NewService(context.Background(), option.WithHTTPClient(client))
 	if err != nil {
 		log.Fatalf("Drive сервис не создан: %v", err)
 	}
-	// Инициализация Telegram бота
+
 	bot, err := tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		log.Fatalf("Ошибка инициализации бота: %v", err)
 	}
+
 	parsedURL, err := url.Parse(webhookURL)
 	if err != nil {
 		log.Fatalf("Неверный формат WEBHOOK_URL: %v", err)
@@ -900,23 +841,30 @@ func main() {
 	if _, err = bot.Request(webhookCfg); err != nil {
 		log.Fatalf("Webhook не установлен: %v", err)
 	}
+
 	keepAlive(webhookURL)
 	setupHandler(bot, sheetsSrv, sheetID, driveSrv, driveFolderID, adminID)
-	// Запуск HTTP-сервера
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 	server := &http.Server{Addr: ":" + port}
 	go func() {
+		log.Printf("HTTP сервер запущен на :%s", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP сервер не запущен: %v", err)
 		}
 	}()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = server.Shutdown(ctx)
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Ошибка при остановке сервера: %v", err)
+	}
+	log.Println("Сервер остановлен.")
 }
